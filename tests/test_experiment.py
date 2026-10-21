@@ -209,3 +209,19 @@ def test_globs_work_under_a_directory_with_brackets(tmp_path):
     write(root / "data" / "a.npy", "")
     paths = experiment(root, files=["data/*.npy"]).upload_files()
     assert [path.name for path in paths] == ["main.py", "a.npy"]
+
+
+def test_an_existing_file_under_brackets_is_a_file_not_a_pattern(tmp_path):
+    root = tmp_path / "exp[1]"
+    write(root / "data.npy", "")
+    found = experiment(root, files=[str((root / "data.npy").resolve())])
+    assert [path.name for path in found.upload_files()] == ["main.py", "data.npy"]
+    assert not [each for each in found.check() if "matches no files" in each.message]
+
+
+def test_a_home_glob_does_not_read_the_home_directory_as_a_pattern(tmp_path, monkeypatch):
+    home = tmp_path / "home[me]"
+    write(home / "data" / "a.npy", "")
+    monkeypatch.setenv("HOME", str(home))
+    paths = experiment(tmp_path, files=["~/data/*.npy"]).upload_files()
+    assert [path.name for path in paths] == ["main.py", "a.npy"]

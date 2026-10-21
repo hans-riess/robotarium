@@ -74,36 +74,47 @@ def user_credentials_file() -> Path:
     return base / "robotarium" / "credentials"
 
 
-def read_env_file(path: Path) -> dict:
+def read_env_file(path: Path, inline_comments: bool = True) -> dict:
     """
-    KEY=VALUE pairs from a dotenv file, read as dotenv does: blank lines and # comments skipped,
-    an `export ` prefix allowed. A value in double quotes keeps everything inside them, with
-    \\, \" and \\n escapes; in single quotes, everything literally. An unquoted value ends at
-    a ` #` comment and has its surrounding whitespace stripped. Nothing is interpolated.
+    KEY=VALUE pairs from a dotenv file, read as python-dotenv reads them: blank lines and #
+    comments skipped, an `export ` prefix allowed. A value in double quotes keeps everything
+    inside them, with the escapes \\\\ \\" \\' \\n \\t \\r \\a \\b \\f \\v decoded and any other
+    backslash kept as it is; in single quotes, everything literally. An unquoted value has its
+    surrounding whitespace stripped and, with inline_comments, ends at a ` #` comment. Nothing
+    is interpolated.
 
     Args:
         path (Path): The file.
+        inline_comments (bool): Treat ` #` in an unquoted value as the start of a comment. The
+            per-user file is read without, since `robotarium login` once wrote values unquoted.
     """
     values = {}
-    for line in Path(path).read_text(encoding="utf-8").splitlines():
-        line = line.strip()
+    # Lines end at \n alone (and a \r before it): a password may hold any other character
+    # str.splitlines() would also break at.
+    for line in Path(path).read_text(encoding="utf-8").split("\n"):
+        line = line.removesuffix("\r").strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, value = line.partition("=")
         key = key.strip()
         if key.startswith("export "):
             key = key[len("export "):].strip()
-        values[key] = _env_value(value.lstrip())
+        values[key] = _env_value(value.lstrip(), inline_comments)
     return values
 
 
-def _env_value(text: str) -> str:
+#: The escapes python-dotenv decodes inside double quotes; any other backslash is kept.
+_ESCAPES = {"\\": "\\", '"': '"', "'": "'", "n": "\n", "t": "\t", "r": "\r", "a": "\a",
+            "b": "\b", "f": "\f", "v": "\v"}
+
+
+def _env_value(text: str, inline_comments: bool = True) -> str:
     """One value, as read_env_file describes."""
     if text[:1] == '"':
         value, escaped = [], False
         for character in text[1:]:
             if escaped:
-                value.append({"n": "\n"}.get(character, character))
+                value.append(_ESCAPES.get(character, "\\" + character))
                 escaped = False
             elif character == "\\":
                 escaped = True
@@ -113,12 +124,15 @@ def _env_value(text: str) -> str:
                 value.append(character)
     elif text[:1] == "'" and "'" in text[1:]:
         return text[1:text.index("'", 1)]
-    return re.split(r"\s#", text, maxsplit=1)[0].strip()
+    if inline_comments:
+        text = re.split(r"\s#", text, maxsplit=1)[0]
+    return text.strip()
 
 
 def _quote(value: str) -> str:
     """A value written so that _env_value reads it back exactly."""
-    return '"%s"' % value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    return '"%s"' % (value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+                     .replace("\r", "\\r"))
 
 
 def env_file_candidates(project_root: Path = None, env_file: Path = None) -> list:
@@ -181,7 +195,7 @@ def resolve(project_root: Path = None, env_file: Path = None, use_keyring: bool 
     user_file = user_credentials_file()
     if (username is None or password is None) and user_file.is_file():
         before = (username, password)
-        take(read_env_file(user_file), str(user_file))
+        take(read_env_file(user_file, inline_comments=False), str(user_file))
         if (username, password) != before:
             warnings.extend(file_warnings(user_file, in_project=False))
 
@@ -206,6 +220,15 @@ def resolve(project_root: Path = None, env_file: Path = None, use_keyring: bool 
             "No %s found. Set %s in the environment or in a .env file beside robotarium.toml, "
             "or run `robotarium login` to keep them in the system keyring. docs/credentials.md "
             "has the details." % (" or ".join(missing), " and ".join(missing)))
+    for name, value, source in ((USERNAME_VARIABLE, username, username_source),
+                                (PASSWORD_VARIABLE, password, password_source)):
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError:
+            # Bytes that are not text, from a mis-encoded environment or file. The value
+            # itself, and the character, stay out of the message.
+            raise CredentialsError("%s from %s is not valid text (it holds bytes that are not "
+                                   "UTF-8); set it again." % (name, source)) from None
 
     return Credentials(username, password, username_source, password_source, tuple(warnings))
 
@@ -275,7 +298,7 @@ def store(username: str, password: str, where: str = "keyring") -> str:
         where (str): "keyring" or "file".
     """
     path = user_credentials_file()
-    values = read_env_file(path) if path.is_file() else {}
+    values = read_env_file(path, inline_comments=False) if path.is_file() else {}
     values[USERNAME_VARIABLE] = username
 
     if where == "keyring":
@@ -300,7 +323,7 @@ def forget() -> list:
     """Removes what store() kept, and says what was removed."""
     removed = []
     path = user_credentials_file()
-    values = read_env_file(path) if path.is_file() else {}
+    values = read_env_file(path, inline_comments=False) if path.is_file() else {}
     username = values.get(USERNAME_VARIABLE) or os.environ.get(USERNAME_VARIABLE)
     if username and keyring_password(username):
         import keyring

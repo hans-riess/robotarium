@@ -125,7 +125,7 @@ class Experiment:
         """
         paths = [self.main]
         for entry in self.files:
-            if glob.has_magic(str(entry)):
+            if self._is_pattern(entry):
                 paths.extend(self._expand(entry))
             else:
                 paths.append(self._resolve(entry))
@@ -138,14 +138,27 @@ class Experiment:
                 unique.append(path)
         return unique
 
+    def _is_pattern(self, entry) -> bool:
+        """
+        Whether a files entry is a glob. One that names an existing file is that file, even
+        with [ ] * or ? in its path -- `submit --file exp[1]/data.npy` must not go looking for
+        exp1/data.npy.
+        """
+        return glob.has_magic(str(entry)) and not self._resolve(entry).is_file()
+
     def _expand(self, entry) -> list:
-        entry = Path(entry).expanduser()
-        if not glob.has_magic(str(entry)):
+        text = str(entry)
+        if not glob.has_magic(text):
             return []
-        # Only the entry is a pattern: a project under a path such as exp[1]/ must not have its
-        # own directory read as one.
-        pattern = str(entry) if entry.is_absolute() else \
-            os.path.join(glob.escape(str(self.root)), str(entry))
+        # Only what the entry spells is a pattern: the project's own directory (exp[1]/), or
+        # the home directory a leading ~ stands for, must not be read as one.
+        if text.startswith("~"):
+            head, _, rest = text.partition("/")
+            pattern = os.path.join(glob.escape(os.path.expanduser(head)), rest)
+        elif Path(text).is_absolute():
+            pattern = text
+        else:
+            pattern = os.path.join(glob.escape(str(self.root)), text)
         return sorted(Path(each) for each in glob.glob(pattern, recursive=True)
                       if Path(each).is_file())
 
@@ -231,7 +244,7 @@ class Experiment:
                 " or ".join(limits.MAIN_FILE_EXTENSIONS), self.main.name)))
 
         for entry in self.files:
-            if glob.has_magic(str(entry)) and not self._expand(entry):
+            if self._is_pattern(entry) and not self._expand(entry):
                 add(Finding(WARNING, "%r matches no files." % str(entry)))
 
         by_name = {}

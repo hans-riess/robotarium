@@ -138,3 +138,32 @@ def test_dotenv_values_read_as_dotenv_does(tmp_path):
     env = write(tmp_path / "x.env", "A=x  # note\nB='single # kept'\nC=\"dq\" # c\nD=a#b\n")
     assert credentials.read_env_file(env) == {"A": "x", "B": "single # kept", "C": "dq",
                                               "D": "a#b"}
+
+
+
+def test_dotenv_escapes_match_python_dotenv(tmp_path):
+    env = write(tmp_path / "x.env", 'A="abc\\def"\nB="C:\\Users\\me"\nC="a\\tb"\nD="q\\"q"\n')
+    assert credentials.read_env_file(env) == {"A": "abc\\def", "B": "C:\\Users\\me",
+                                              "C": "a\tb", "D": 'q"q'}
+
+
+@pytest.mark.parametrize("separator", ["\r", "\v", "\f", "\x1c", "\x85", "\u2028"])
+def test_line_separators_inside_a_password_survive(separator):
+    password = "a%sb" % separator
+    credentials.store(USERNAME, password, where="file")
+    assert resolve(interactive=False).password == password
+
+
+def test_a_file_the_first_version_of_login_wrote_still_reads_back(tmp_path):
+    path = credentials.user_credentials_file()
+    write(path, "# Written by `robotarium login`.\nROBOTARIUM_USERNAME=%s\n"
+                "ROBOTARIUM_PASSWORD=pass # word\n" % USERNAME)
+    assert resolve(interactive=False).password == "pass # word"
+
+
+def test_a_password_that_is_not_text_is_refused_without_showing_it(monkeypatch):
+    monkeypatch.setenv("ROBOTARIUM_USERNAME", USERNAME)
+    monkeypatch.setenv("ROBOTARIUM_PASSWORD", "secret\udcff")
+    with pytest.raises(CredentialsError, match="not valid text") as error:
+        resolve(interactive=False)
+    assert "secret" not in str(error.value)

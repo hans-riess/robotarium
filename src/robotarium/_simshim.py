@@ -11,8 +11,9 @@ experiment ended with debug() or call_at_scripts_end(). It writes all of that as
 in $ROBOTARIUM_SIM_REPORT when the main file finishes, however it finishes.
 
 $ROBOTARIUM_SIM_FAST=1 turns off the simulator's real-time pacing, which changes how long the
-run takes to watch and nothing about what it does. skip_initialization is always turned off,
-since the testbed always drives the robots to their initial poses first.
+run takes to watch and nothing about what it does. skip_initialization=True is overridden,
+since the testbed always drives the robots to their initial poses first. Past
+$ROBOTARIUM_SIM_MAX_STEPS steps the run is stopped: it could not be submitted anyway.
 """
 
 import atexit
@@ -34,10 +35,21 @@ REPORT = {
     "exception": None,
     "wall_seconds": None,
     "skipped_initialization": False,
+    "too_long": False,
 }
 
 _INSTANCES = []
 _STARTED = time.time()
+
+#: Steps after which the run is stopped: past the form's maximum duration. 0 for no limit.
+MAX_STEPS = int(os.environ.get("ROBOTARIUM_SIM_MAX_STEPS") or 0)
+
+
+class TooLong(BaseException):
+    """
+    Raised from step() past MAX_STEPS. A BaseException, so the main file's own `except
+    Exception` cannot swallow it and loop on.
+    """
 
 
 def install(fast: bool) -> bool:
@@ -59,11 +71,12 @@ def install(fast: bool) -> bool:
             kwargs["sim_in_real_time"] = False
         # The testbed always drives the robots to their initial poses; a run that skips the
         # drive is shorter than the one the testbed will do, and starts from somewhere else.
+        # Only touched when the main file passed it: rps before V2 has no such keyword.
         if kwargs.get("skip_initialization"):
             print("robotarium simulate: ignoring skip_initialization=True -- the testbed always "
                   "drives the robots to their initial poses first.", file=sys.stderr)
             REPORT["skipped_initialization"] = True
-        kwargs["skip_initialization"] = False
+            kwargs["skip_initialization"] = False
         REPORT["robots"].append(kwargs.get("number_of_robots", -1))
         _INSTANCES.append(self)
         original_init(self, *args, **kwargs)
@@ -73,6 +86,8 @@ def install(fast: bool) -> bool:
             REPORT["init_steps"] += 1
         else:
             REPORT["steps"] += 1
+        if MAX_STEPS and REPORT["init_steps"] + REPORT["steps"] > MAX_STEPS:
+            raise TooLong()
         return original_step(self, *args, **kwargs)
 
     cls.__init__ = __init__
@@ -121,13 +136,18 @@ def main() -> int:
     sys.argv = [str(main_file)]
     try:
         runpy.run_path(str(main_file), run_name="__main__")
+    except TooLong:
+        REPORT["too_long"] = True
+        print("robotarium simulate: stopped after %d steps, past the form's maximum duration."
+              % MAX_STEPS, file=sys.stderr)
+        return 4
     except SystemExit as exit_:
         code = exit_.code
         if code is None or isinstance(code, int):
             return code or 0
         # sys.exit("message"): Python prints the message and exits 1, and so does this.
         print(code, file=sys.stderr)
-        REPORT["exception"] = "SystemExit: %s" % code
+        REPORT["exception"] = "SystemExit: %s" % (code,)
         return 1
     except BaseException:  # noqa: BLE001 -- the report is the point; the traceback is printed
         REPORT["exception"] = traceback.format_exc(limit=-8)

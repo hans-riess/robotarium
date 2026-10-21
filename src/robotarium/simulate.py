@@ -69,6 +69,7 @@ class SimulationReport:
     exception: str = None
     wall_seconds: float = None
     skipped_initialization: bool = False
+    too_long: bool = False
     output: str = ""
 
     @property
@@ -96,9 +97,18 @@ class SimulationReport:
         add = findings.append
 
         if self.timed_out:
-            add(Finding(ERROR, "The run was stopped at the timeout, after %d steps."
-                               % self.total_steps))
-            return findings
+            add(Finding(ERROR, "The run was stopped at the timeout, after %s."
+                               % ("%d steps" % self.total_steps if self.rps
+                                  else "an unknown number of steps (it did not stop on Ctrl-C, "
+                                       "so it was killed before it could report)")))
+            if self.rps is None:
+                return findings
+        elif self.too_long:
+            add(Finding(ERROR, "The run was stopped after %d steps, about %.0f s on the testbed: "
+                               "longer than the form's %d s maximum. A drive to initial poses "
+                               "the robots cannot reach also never ends."
+                               % (self.total_steps, self.testbed_seconds,
+                                  limits.MAX_DURATION_SECONDS)))
         if self.rps is None:
             if self.returncode == 3:
                 add(Finding(ERROR, "The simulator (rps) is not importable. Install it (pip "
@@ -110,7 +120,7 @@ class SimulationReport:
                 add(Finding(ERROR, "The run ended before the simulator could report (exit %d): "
                                    "%s" % (self.returncode, last[0])))
             return findings
-        if self.returncode != 0:
+        if self.returncode != 0 and not (self.timed_out or self.too_long):
             last = (self.exception or self.output).strip().splitlines()[-1:] or ["no output"]
             add(Finding(ERROR, "The main file failed in the simulator (exit %d): %s"
                                % (self.returncode, last[0])))
@@ -209,47 +219,49 @@ def run(bundle, simulator=None, fast: bool = True, headless: bool = True, timeou
         Path(log_dir).mkdir(parents=True, exist_ok=True)
         environment["ROBOTARIUM_LOG_DIR"] = str(Path(log_dir).resolve())
 
+    # The run stops itself past the form's maximum: no run that long can be submitted, and a
+    # drive to initial poses the robots cannot reach would otherwise never end.
+    environment["ROBOTARIUM_SIM_MAX_STEPS"] = str(
+        int(limits.MAX_DURATION_SECONDS / limits.STEP_SECONDS) + 1)
+
     with tempfile.TemporaryDirectory() as scratch:
         report_path = Path(scratch) / "report.json"
         environment["ROBOTARIUM_SIM_REPORT"] = str(report_path)
         command = [python or sys.executable, "-m", "robotarium._simshim", str(bundle.main)]
         log.debug("running %s in %s", " ".join(command), bundle.directory)
 
-        tail = collections.deque(maxlen=60)
+        # Its own process group on POSIX, so a timeout or Ctrl-C reaches anything the main file
+        # started too.
         process = subprocess.Popen(command, cwd=bundle.directory, env=environment,
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                                   bufsize=1)
+                                   bufsize=1, start_new_session=os.name == "posix")
+        tail = collections.deque(maxlen=60)
+        reader = threading.Thread(target=_relay, args=(process.stdout, tail, echo), daemon=True)
+        reader.start()
+
         stopped = threading.Event()
         timer = None
         if timeout:
             def stop():
-                # Ctrl-C first, so the shim's report is still written; a kill if that is
-                # ignored.
+                if process.poll() is not None:
+                    return  # it finished in time, whatever is still being printed
                 stopped.set()
-                try:
-                    if os.name == "posix":
-                        process.send_signal(signal.SIGINT)
-                    else:
-                        process.terminate()
-                except OSError:
-                    pass
-                killer = threading.Timer(10.0, process.kill)
+                _signal(process, signal.SIGINT)  # so the shim still writes its report
+                killer = threading.Timer(10.0, _signal, (process, signal.SIGKILL))
                 killer.daemon = True
                 killer.start()
             timer = threading.Timer(float(timeout), stop)
             timer.start()
         try:
-            for line in process.stdout:
-                tail.append(line)
-                if echo:
-                    sys.stdout.write(line)
-                    sys.stdout.flush()
             returncode = process.wait()
         finally:
             if timer is not None:
                 timer.cancel()
             if process.poll() is None:
-                process.kill()
+                _signal(process, signal.SIGKILL)
+                process.wait()
+        # The rest of the output, unless something the main file started still holds the pipe.
+        reader.join(timeout=5)
 
         data = {}
         if report_path.is_file():
@@ -257,7 +269,28 @@ def run(bundle, simulator=None, fast: bool = True, headless: bool = True, timeou
 
     known = {key: data[key] for key in ("rps", "robots", "init_steps", "steps", "errors",
                                         "ended", "exception", "wall_seconds",
-                                        "skipped_initialization") if key in data}
+                                        "skipped_initialization", "too_long") if key in data}
     return SimulationReport(returncode=returncode, timed_out=stopped.is_set(),
                             output="".join(tail), **known)
 
+
+def _relay(stream, tail, echo: bool) -> None:
+    """Copies the run's output to the console as it comes, keeping the last lines."""
+    for line in stream:
+        tail.append(line)
+        if echo:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+
+
+def _signal(process, number) -> None:
+    """Sends a signal to the run and everything it started; on Windows, terminates it."""
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == "posix":
+            os.killpg(process.pid, number)
+        else:
+            process.terminate()
+    except OSError:
+        pass

@@ -207,4 +207,48 @@ def test_an_interrupted_upload_is_recorded(project, fake_site, logged_in, monkey
     entry = ledger.read(project.output_dir)[-1]
     assert (entry["outcome"], entry["stage"], entry["orphaned_uploads"]) == \
         ("interrupted", "upload", 1)
-    assert any("attached to no experiment" in line for line in printed)
+    assert entry["error"] == "KeyboardInterrupt"
+    assert any("1 file(s) were uploaded, and one more may have been" in line for line in printed)
+
+
+def test_a_gateway_error_at_create_is_ambiguous_not_orphaned(project, fake_site, logged_in,
+                                                              monkeypatch):
+    def gateway(self, form):
+        raise RobotariumError("POST experiment/create answered HTTP 504: Gateway Timeout",
+                              status=504)
+
+    monkeypatch.setattr(RobotariumClient, "create_experiment", gateway)
+    with pytest.raises(RobotariumError, match="may have been created"):
+        submit(project, confirm=False, out=lambda *_: None)
+    entry = ledger.read(project.output_dir)[-1]
+    assert entry["orphaned_uploads"] == 0 and "may have been created" in entry["consequence"]
+
+
+def test_a_cut_off_error_page_is_still_a_clean_error(project, fake_site, logged_in,
+                                                     monkeypatch):
+    import http.client
+    import urllib.error
+
+    class CutOff(urllib.error.HTTPError):
+        def read(self, *arguments):
+            raise http.client.IncompleteRead(b"partial")
+
+    def respond(request, timeout=None):
+        raise CutOff(request.full_url, 502, "Bad Gateway", {}, None)
+
+    monkeypatch.setattr("urllib.request.urlopen", respond)
+    with pytest.raises(RobotariumError, match="HTTP 502: Bad Gateway") as error:
+        RobotariumClient().settings()
+    assert error.value.status == 502
+
+
+def test_an_unexpected_errors_text_stays_out_of_the_ledger(project, fake_site, logged_in,
+                                                           monkeypatch):
+    def choke(self, email, password):
+        raise UnicodeEncodeError("utf-8", "pass\udcffword", 4, 5, "surrogates not allowed")
+
+    monkeypatch.setattr(RobotariumClient, "login", choke)
+    with pytest.raises(UnicodeEncodeError):
+        submit(project, confirm=False, out=lambda *_: None)
+    entry = ledger.read(project.output_dir)[-1]
+    assert entry["error"] == "UnicodeEncodeError" and "word" not in json.dumps(entry)

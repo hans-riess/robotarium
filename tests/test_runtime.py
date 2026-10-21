@@ -171,3 +171,32 @@ def test_a_refused_record_keeps_nothing_of_it(tmp_path, fresh_runtime):
     run = fresh_runtime.load_run(log.save())
     assert run.data["a"].shape == (2, 2) and run.data["b"].shape == (2, 3)
     assert list(run.steps["a"]) == list(run.steps["b"]) == [0, 1]
+
+
+def test_a_note_belongs_to_the_last_recorded_step(tmp_path, fresh_runtime):
+    log = fresh_runtime.RunLogger(directory=tmp_path, save_at_exit=False, echo=False)
+    log.note("before anything")
+    log.record(step=10, x=1)
+    log.note("at ten")
+    assert [note["step"] for note in log.meta["notes"]] == [0, 10]
+
+
+def test_a_value_that_needs_pickling_is_refused(tmp_path, fresh_runtime):
+    log = fresh_runtime.RunLogger(directory=tmp_path, save_at_exit=False)
+    with pytest.raises(ValueError, match="'target'"):
+        log.record(target=None, x=1.0)
+    log.record(label="phase one", x=1.0)
+    assert fresh_runtime.load_run(log.save()).data["label"][0] == "phase one"
+
+
+def test_a_failed_write_leaves_no_partial_file(tmp_path, fresh_runtime, monkeypatch):
+    log = fresh_runtime.RunLogger(directory=tmp_path, save_at_exit=False)
+    log.record(x=1)
+
+    def full(*arguments, **keywords):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(fresh_runtime.np, "savez_compressed", full)
+    with pytest.raises(OSError):
+        log.save()
+    assert list(tmp_path.iterdir()) == []

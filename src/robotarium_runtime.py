@@ -349,6 +349,7 @@ class RunLogger:
         self._series = {}
         self._steps = {}
         self._next_step = 0
+        self._last_step = None
         self._records = 0
         self._dirty = False
         built = bundle().get("experiment") or {}
@@ -373,6 +374,10 @@ class RunLogger:
         # Every value is checked before any is kept, so a refused record leaves no series a
         # step longer than the others.
         for key, array in arrays.items():
+            if array.dtype == object:
+                raise ValueError("RunLogger: %r is not numbers or text (it would need pickling, "
+                                 "and the file must load without it). Record numbers, arrays "
+                                 "or strings; put anything else in meta." % key)
             series = self._series.get(key)
             if series and series[0].shape != array.shape:
                 raise ValueError("RunLogger: %r was recorded with shape %s and now %s. Record "
@@ -382,6 +387,7 @@ class RunLogger:
             self._series.setdefault(key, []).append(array)
             self._steps.setdefault(key, []).append(step)
         self._next_step = step + 1
+        self._last_step = step
         self._records += 1
         self._dirty = True
         if self.autosave_every and self._records % self.autosave_every == 0:
@@ -393,9 +399,11 @@ class RunLogger:
 
         Args:
             message (str): The remark.
-            step (int): The step it is about; default the current one.
+            step (int): The step it is about; default the last one recorded (0 before any).
         """
-        step = self._next_step if step is None else int(step)
+        if step is None:
+            step = 0 if self._last_step is None else self._last_step
+        step = int(step)
         self.meta["notes"].append({"step": step, "seconds": round(step * STEP_SECONDS, 3),
                                    "message": str(message)})
         self._dirty = True
@@ -415,9 +423,16 @@ class RunLogger:
         # Written aside and moved into place, so a run killed mid-write leaves the last
         # complete file rather than a truncated one.
         partial = self.path.with_name(self.path.name + ".partial")
-        with open(partial, "wb") as handle:
-            np.savez_compressed(handle, **arrays)
-        os.replace(partial, self.path)
+        try:
+            with open(partial, "wb") as handle:
+                np.savez_compressed(handle, **arrays)
+            os.replace(partial, self.path)
+        except BaseException:
+            try:
+                partial.unlink()
+            except OSError:
+                pass
+            raise
         self._dirty = False
         return self.path
 

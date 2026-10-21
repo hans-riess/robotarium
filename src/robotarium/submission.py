@@ -255,10 +255,10 @@ def submit(target, credentials=None, draft: bool = None, simulate_first: bool = 
     except BaseException as error:
         # Whatever stopped it -- a refusal, a dropped connection, Ctrl-C -- the attempt is
         # recorded, with what is left on the site, before the error goes on up.
-        consequence = _consequence(stage, error, uploaded, experiment_id)
+        left, consequence = _consequence(stage, error, uploaded, experiment_id)
         entry.update(outcome="interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
-                     stage=stage, error=str(error) or type(error).__name__,
-                     orphaned_uploads=len(uploaded) if experiment_id is None else 0,
+                     stage=stage, error=_ledger_error(error),
+                     orphaned_uploads=len(uploaded) if left == "orphaned" else 0,
                      experiment_id=experiment_id, consequence=consequence)
         ledger.record(project.output_dir, entry)
         if consequence and isinstance(error, RobotariumError):
@@ -277,19 +277,45 @@ def submit(target, credentials=None, draft: bool = None, simulate_first: bool = 
                             uploaded=uploaded)
 
 
-def _consequence(stage: str, error: BaseException, uploaded: list, experiment_id) -> str:
-    """What a failure at `stage` leaves behind on the site, as a sentence; "" for nothing."""
+def _consequence(stage: str, error: BaseException, uploaded: list, experiment_id) -> tuple:
+    """
+    What a failure at `stage` leaves behind on the site: a kind ("orphaned", "unknown",
+    "unmarked" or None) and a sentence for the person ("" for nothing).
+
+    An answer that never came (ConnectionLost), a gateway's 5xx, or anything else that stopped
+    the request part-way means the site may have acted on it, so those are "unknown".
+    """
+    unanswered = isinstance(error, ConnectionLost) or not isinstance(error, RobotariumError) \
+        or (getattr(error, "status", None) or 0) >= 500
     if stage == "mark-main":
-        return ("Experiment %s was created, but its main file is not marked: tick \"Main File\" "
-                "on %s rather than submitting again." % (experiment_id, DASHBOARD_URL))
-    if stage == "create" and (isinstance(error, ConnectionLost)
-                              or not isinstance(error, RobotariumError)):
-        return ("The experiment may have been created before the answer was lost: check %s "
-                "before submitting again." % DASHBOARD_URL)
+        if unanswered:
+            return "unknown", ("Experiment %s was created; whether its main file got marked is "
+                               "unknown. Check \"Main File\" on %s rather than submitting "
+                               "again." % (experiment_id, DASHBOARD_URL))
+        return "unmarked", ("Experiment %s was created, but its main file is not marked: tick "
+                            "\"Main File\" on %s rather than submitting again."
+                            % (experiment_id, DASHBOARD_URL))
+    if stage == "create" and unanswered:
+        return "unknown", ("The experiment may have been created before the answer was lost: "
+                           "check %s before submitting again." % DASHBOARD_URL)
+    if stage == "upload" and unanswered:
+        return "orphaned", ("%d file(s) were uploaded, and one more may have been, before it "
+                            "failed; none is attached to an experiment." % len(uploaded))
     if uploaded:
-        return ("%d file(s) were uploaded before it failed and are attached to no experiment."
-                % len(uploaded))
-    return ""
+        return "orphaned", ("%d file(s) were uploaded before it failed and are attached to no "
+                            "experiment." % len(uploaded))
+    return None, ""
+
+
+def _ledger_error(error: BaseException) -> str:
+    """
+    The error as the ledger keeps it. A RobotariumError's message is written to carry nothing
+    of the request; any other exception's might (a UnicodeEncodeError quotes the character it
+    choked on), so only its type is kept in a file meant to be safe to commit.
+    """
+    if isinstance(error, RobotariumError):
+        return str(error)
+    return type(error).__name__
 
 
 def _ledger_entry(prepared: Prepared, draft: bool, snapshot: Path) -> dict:

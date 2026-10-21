@@ -121,10 +121,18 @@ r.debug()
     assert "too close" in levels(report.findings(experiment), ERROR)
 
 
-def test_a_timeout_is_reported_as_one():
-    report = SimulationReport(returncode=-2, timed_out=True, steps=40)
-    found = report.findings(experiment())
-    assert "stopped at the timeout, after 40 steps" in levels(found, ERROR)
+def test_a_timeout_is_reported_with_the_rest_of_the_verdict():
+    report = SimulationReport(returncode=-2, timed_out=True, rps="/rps", robots=[6], steps=40,
+                              errors={"robots_too_close": 2})
+    found = levels(report.findings(experiment()), ERROR)
+    assert "stopped at the timeout, after 40 steps" in found
+    assert "too close" in found and "ran 6 robots" in found
+    assert "failed in the simulator" not in found
+
+
+def test_a_killed_run_does_not_claim_a_step_count():
+    found = levels(SimulationReport(returncode=-9, timed_out=True).findings(experiment()), ERROR)
+    assert "unknown number of steps" in found
 
 
 def _bundle_of(tmp_path, source, robots=2):
@@ -154,15 +162,61 @@ r.debug()
 @needs_simulator
 def test_a_timed_out_run_still_reports(tmp_path):
     experiment, bundle = _bundle_of(tmp_path, """\
+import time
 import rps.robotarium as robotarium
 r = robotarium.Robotarium(number_of_robots=2)
 while True:
     r.get_poses()
     r.step()
+    time.sleep(0.01)
 """)
     report = simulate.run(bundle, echo=False, timeout=8)
     assert report.timed_out and report.robots == [2] and report.steps > 0
     assert "stopped at the timeout" in levels(report.findings(experiment), ERROR)
+
+
+@needs_simulator
+def test_a_run_that_never_ends_stops_at_the_forms_maximum(tmp_path):
+    experiment, bundle = _bundle_of(tmp_path, """\
+import rps.robotarium as robotarium
+r = robotarium.Robotarium(number_of_robots=2)
+while True:
+    try:
+        r.get_poses()
+        r.step()
+    except Exception:
+        pass
+""")
+    report = simulate.run(bundle, echo=False, timeout=300)
+    assert report.too_long and not report.timed_out
+    assert report.total_steps == int(600 / 0.033) + 2
+    assert "longer than the form's 600 s maximum" in levels(report.findings(experiment), ERROR)
+
+
+@needs_simulator
+def test_a_finished_run_is_not_a_timed_out_one(tmp_path):
+    experiment, bundle = _bundle_of(tmp_path, """\
+import rps.robotarium as robotarium
+r = robotarium.Robotarium(number_of_robots=2)
+r.get_poses()
+r.step()
+r.debug()
+""")
+    report = simulate.run(bundle, echo=False, timeout=120)
+    assert report.returncode == 0 and not report.timed_out
+
+
+@needs_simulator
+def test_a_process_the_main_file_leaves_behind_does_not_hold_the_run(tmp_path):
+    experiment, bundle = _bundle_of(tmp_path, """\
+import subprocess, sys, time
+subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+time.sleep(60)
+""")
+    import time
+    started = time.time()
+    report = simulate.run(bundle, echo=False, timeout=3)
+    assert report.timed_out and time.time() - started < 30
 
 
 @needs_simulator
@@ -182,3 +236,34 @@ def test_an_exit_message_is_kept(tmp_path):
     experiment, bundle = _bundle_of(tmp_path, "import sys\nsys.exit('bad parameters')\n")
     report = simulate.run(bundle, echo=False, timeout=60)
     assert report.returncode == 1 and "bad parameters" in report.output
+
+
+def test_an_rps_without_skip_initialization_still_runs(tmp_path):
+    """rps before V2 has an explicit __init__ signature that refuses unknown keywords."""
+    write(tmp_path / "oldsim" / "rps" / "__init__.py", "")
+    write(tmp_path / "oldsim" / "rps" / "robotarium.py", """\
+class Robotarium:
+    def __init__(self, number_of_robots=-1, show_figure=True, sim_in_real_time=True,
+                 initial_conditions=None):
+        self.number_of_robots = number_of_robots
+        self._errors = {}
+
+    def get_poses(self):
+        return None
+
+    def step(self):
+        pass
+
+    def call_at_scripts_end(self):
+        print("old rps: done")
+""")
+    experiment, bundle = _bundle_of(tmp_path / "exp", """\
+import rps.robotarium as robotarium
+r = robotarium.Robotarium(number_of_robots=2, show_figure=False)
+r.get_poses()
+r.step()
+r.call_at_scripts_end()
+""")
+    report = simulate.run(bundle, simulator=tmp_path / "oldsim", echo=False, timeout=60)
+    assert report.returncode == 0, report.output
+    assert report.robots == [2] and report.steps == 1 and report.ended

@@ -51,8 +51,15 @@ simulator saw:
 Two things are always as on the testbed, whatever the main file asks for. The robots are
 driven to their initial poses first, even if the main file passes `skip_initialization=True`,
 because the testbed always does that drive and a run without it is shorter than the real one.
-And the run never sees `ROBOTARIUM_USERNAME` or `ROBOTARIUM_PASSWORD`. A `--timeout` stops the
-run with Ctrl-C, so the report is still written and says the run timed out.
+And the run never sees `ROBOTARIUM_USERNAME` or `ROBOTARIUM_PASSWORD`.
+
+A run is stopped once it passes 600 s of testbed time (18,182 steps), the form's maximum, since
+it could never be submitted. This also ends a drive to initial poses the robots can't reach,
+which otherwise never finishes. `--timeout` bounds the wall clock as well. On Linux and macOS it
+stops the run, and anything the run started, with Ctrl-C, so the report is still written and
+lists the run's collisions and robot count along with the timeout. A run that ignores Ctrl-C is
+killed 10 s later. On Windows a timeout terminates the run outright, so its step count is
+unknown.
 
 The wall clock is also compared with the declared duration. A run longer than its estimated
 duration is an error, because the testbed stops it, and the message suggests a duration with

@@ -174,6 +174,16 @@ def test_a_declared_but_unused_package_is_noted(tmp_path):
     ("import Foo.Bar: baz, qux", ["Foo"]),
     ("using A: f,\n    g\nusing B", ["A", "B"]),
     ("x = 1  # using Trailing\n", []),
+    ('@warn "No GPU found; using CPU instead"\nusing JSON3', ["JSON3"]),
+    ('pyexec("import numpy as np; import scipy.linalg as sl", Main)', []),
+    ('const LABEL = "robot, #"\nusing JSON3', ["JSON3"]),
+    ("using CSV,\n\n    # a comment\n    DataFrames", ["CSV", "DataFrames"]),
+    ("@everywhere using Distributed", ["Distributed"]),
+    ("using Ünïcode", ["Ünïcode"]),
+    ("x = A'; using B", ["B"]),
+    ("c = ';'; using D", ["D"]),
+    ('s = """\nusing NotReal; x\n"""\nusing E', ["E"]),
+    ("#= outer #= inner =# using F =#\nusing G", ["G"]),
 ])
 def test_julia_statement_forms_are_parsed(source, expected):
     assert julia_packages_used(source) == expected
@@ -216,3 +226,9 @@ def test_the_stdlib_is_the_testbeds(tmp_path):
 def test_skipping_initialization_is_warned_about(tmp_path):
     main = GOOD_MAIN.replace("show_figure=False", "show_figure=False, skip_initialization=True")
     assert "skip_initialization" in messages(findings_for(tmp_path, main), WARNING)
+
+
+def test_a_version_guarded_import_is_optional(tmp_path):
+    main = GOOD_MAIN + ("import sys\nif sys.version_info >= (3, 11):\n    import tomllib\n"
+                        "else:\n    import tomli as tomllib\n")
+    assert messages(findings_for(tmp_path, main), WARNING) == ""

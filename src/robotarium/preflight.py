@@ -101,7 +101,8 @@ def imports(tree: ast.AST) -> list:
     """
     The imports in a module as (top-level name, line, level, optional) tuples. level is the
     relative-import depth (0 for absolute). optional is True for an import guarded by a try
-    that catches ImportError, or under `if TYPE_CHECKING:` -- it may fail without failing the run.
+    that catches ImportError, under `if TYPE_CHECKING:`, or under a sys.version_info test -- it
+    may fail without failing the run.
     """
     found = []
 
@@ -116,6 +117,12 @@ def imports(tree: ast.AST) -> list:
         if isinstance(node, ast.If) and _is_type_checking(node.test):
             for child in node.orelse:
                 visit(child, optional)
+            return
+        if isinstance(node, ast.If) and _is_version_check(node.test):
+            # `if sys.version_info >= (3, 11): import tomllib / else: import tomli`: each
+            # branch runs only where it works.
+            for child in node.body + node.orelse:
+                visit(child, True)
             return
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -137,6 +144,11 @@ def _catches_import_error(handler: ast.ExceptHandler) -> bool:
     return any(isinstance(each, ast.Name)
                and each.id in ("ImportError", "ModuleNotFoundError", "Exception")
                for each in types)
+
+
+def _is_version_check(test: ast.AST) -> bool:
+    return any(isinstance(node, ast.Attribute) and node.attr == "version_info"
+               for node in ast.walk(test))
 
 
 def _is_type_checking(test: ast.AST) -> bool:
@@ -289,8 +301,64 @@ def _module_int_constants(tree: ast.Module) -> dict:
 # ---------------------------------------------------------------------------
 
 _INCLUDE = re.compile(r"\binclude\(\s*\"([^\"]+)\"\s*\)")
-_STATEMENT = re.compile(r"^\s*(?:using|import)\s+(.*)$", re.DOTALL)
-_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_!]*")
+_STATEMENT = re.compile(r"^\s*(?:@[\w.]+\s+)*(?:using|import)\s+(.*)$", re.DOTALL)
+_NAME = re.compile(r"[^\W\d][\w!]*")
+
+
+def julia_code(source: str) -> str:
+    """
+    A Julia source with its comments removed and the inside of every string, command and
+    character literal blanked, newlines kept: what is left is code alone, so a `;` or `#` or the
+    word `using` inside a string cannot be read as a statement. One left-to-right pass, as
+    Julia's own lexer reads it: `#=` comments nest, triple-quoted strings span lines, and a `'`
+    is a character literal unless it follows something it could transpose (`A'`).
+    """
+    out = []
+    i, n = 0, len(source)
+
+    def blank(text):
+        out.append("".join("\n" if character == "\n" else " " for character in text))
+
+    while i < n:
+        character = source[i]
+        if source.startswith("#=", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if source.startswith("#=", j):
+                    depth, j = depth + 1, j + 2
+                elif source.startswith("=#", j):
+                    depth, j = depth - 1, j + 2
+                else:
+                    j += 1
+            blank(source[i:j])
+            i = j
+        elif character == "#":
+            j = source.find("\n", i)
+            j = n if j < 0 else j
+            i = j
+        elif source.startswith('"""', i) or character in '"`':
+            quote = '"""' if source.startswith('"""', i) else character
+            j = i + len(quote)
+            while j < n and not source.startswith(quote, j):
+                j += 2 if source[j] == "\\" else 1
+            j = min(n, j + len(quote))
+            out.append(quote)
+            blank(source[i + len(quote):max(i + len(quote), j - len(quote))])
+            out.append(quote if j - i >= 2 * len(quote) else "")
+            i = j
+        elif character == "'" and not (out and out[-1][-1:] and
+                                        (out[-1][-1].isalnum() or out[-1][-1] in ")]}'_.!")):
+            match = re.match(r"'(?:\\.[^']{0,8}|[^'\\\n])'", source[i:])
+            if match:
+                out.append("' '")
+                i += match.end()
+            else:
+                out.append(character)
+                i += 1
+        else:
+            out.append(character)
+            i += 1
+    return "".join(out)
 
 
 def julia_packages_used(source: str) -> list:
@@ -298,15 +366,14 @@ def julia_packages_used(source: str) -> list:
     The packages a Julia source loads with `using` or `import`, in order, without repeats.
 
     Handles several statements on a line (`using A; using B`), a list continued over lines
-    (`using A,` / `B`), `using A: f, g`, `import A as B` and `import A.Sub`. Relative imports
-    (`using .Inner`) are the file's own modules and are left out.
+    (`using A,` / `B`, blank or comment lines between), `using A: f, g`, `import A as B`,
+    `import A.Sub`, and a macro in front (`@everywhere using A`). Strings and comments are
+    ignored (see julia_code). Relative imports (`using .Inner`) are the file's own modules and
+    are left out.
     """
-    source = re.sub(r"#=.*?=#", " ", source, flags=re.DOTALL)
-    source = re.sub(r"#[^\n]*", "", source)
-    # A list that ends a line with a comma continues on the next.
-    source = re.sub(r",[ \t]*\n", ", ", source)
+    code = re.sub(r",\s*\n", ", ", julia_code(source))
     used = []
-    for line in source.splitlines():
+    for line in code.splitlines():
         for statement in line.split(";"):
             match = _STATEMENT.match(statement)
             if not match:
