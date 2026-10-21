@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv*
+.pytest_cache/
+.DS_Store
+
+# Credentials for `robotarium submit`, if kept in a file. Never commit them.
+.env
+
+# What `robotarium` builds when run from inside this repository.
+.robotarium/

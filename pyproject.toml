@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools >= 77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robotarium"
+description = "Bundle, check, simulate and submit experiments to the Georgia Tech Robotarium."
+version = "0.1.0"
+readme = "README.md"
+requires-python = ">=3.11"
+
+# Submitting needs nothing beyond the standard library: urllib for the site, tomllib for the
+# manifest. What an experiment needs to RUN -- numpy, the rps simulator, juliacall -- it needs
+# where it runs, so those are extras.
+dependencies = []
+
+[project.optional-dependencies]
+# The Robotarium Python simulator and what it imports, for `robotarium simulate`. rps has no
+# PyPI release, so it comes from git.
+sim = [
+    "numpy",
+    "matplotlib",
+    "cvxopt",
+    "robotarium_python_simulator @ git+https://github.com/robotarium/robotarium_python_simulator",
+]
+# For a backend.jl: juliacall brings juliapkg and, on first use, Julia itself.
+julia = ["juliacall"]
+# `robotarium login` keeps the password in the system keyring with this.
+keyring = ["keyring"]
+yaml = ["pyyaml"]
+test = ["pytest", "numpy"]
+
+[project.scripts]
+robotarium = "robotarium.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+# robotarium_runtime is a top-level module so that `import robotarium_runtime` works the same
+# here as on the testbed, where it is uploaded beside the main file.
+py-modules = ["robotarium_runtime"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+robotarium = ["data/*.txt"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "simulator: runs the Robotarium simulator (rps); skipped where it is not installed",
+]

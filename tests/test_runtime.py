@@ -1,0 +1,150 @@
+"""robotarium_runtime: what travels to the testbed with the experiment."""
+
+import importlib.abc
+import importlib.util
+import json
+import sys
+import types
+
+import numpy as np
+import pytest
+
+from conftest import write
+
+
+def test_a_run_is_recorded_and_read_back(tmp_path, fresh_runtime):
+    log = fresh_runtime.RunLogger("demo", directory=tmp_path, meta={"seed": 3},
+                                  save_at_exit=False, echo=False)
+    for step in range(5):
+        log.record(poses=np.full((3, 2), step), error=step * 0.5)
+    log.note("halfway", step=2)
+    path = log.save()
+
+    run = fresh_runtime.load_run(path)
+    assert run.data["poses"].shape == (5, 3, 2)
+    assert run.data["poses"][4, 0, 0] == 4
+    assert list(run.steps["error"]) == [0, 1, 2, 3, 4]
+    assert run.meta["seed"] == 3 and run.meta["records"] == 5
+    assert run.meta["notes"] == [{"step": 2, "seconds": 0.066, "message": "halfway"}]
+    assert not path.with_name(path.name + ".partial").exists()
+
+
+def test_a_changing_shape_is_refused(tmp_path, fresh_runtime):
+    log = fresh_runtime.RunLogger(directory=tmp_path, save_at_exit=False)
+    log.record(poses=np.zeros((3, 2)))
+    with pytest.raises(ValueError, match="poses"):
+        log.record(poses=np.zeros((3, 4)))
+
+
+def test_autosave_writes_as_it_goes(tmp_path, fresh_runtime):
+    log = fresh_runtime.RunLogger(directory=tmp_path, autosave_every=2, save_at_exit=False)
+    log.record(x=1)
+    assert not log.path.exists()
+    log.record(x=2)
+    assert fresh_runtime.load_run(log.path).data["x"].tolist() == [1, 2]
+
+
+def test_the_log_directory_follows_the_environment(tmp_path, monkeypatch, fresh_runtime):
+    monkeypatch.setenv("ROBOTARIUM_LOG_DIR", str(tmp_path / "runs"))
+    log = fresh_runtime.RunLogger("x", save_at_exit=False)
+    assert log.path.parent == tmp_path / "runs"
+
+
+def test_the_bundle_module_is_read(tmp_path, monkeypatch, fresh_runtime):
+    write(tmp_path / "robotarium_bundle.py",
+          "EXPERIMENT = {'title': 'T'}\nCONFIG = {'gain': 2}\nJULIA = {'packages': []}\n")
+    monkeypatch.setattr(fresh_runtime, "here", lambda: tmp_path)
+    assert fresh_runtime.bundle()["experiment"] == {"title": "T"}
+    assert fresh_runtime.config() == {"gain": 2}
+
+
+def test_outside_a_bundle_the_manifest_supplies_the_config(tmp_path, monkeypatch,
+                                                           fresh_runtime):
+    write(tmp_path / "robotarium.toml", "[experiment]\ntitle = 'x'\n\n[config]\ngain = 4\n")
+    (tmp_path / "src").mkdir()
+    monkeypatch.setattr(fresh_runtime, "here", lambda: tmp_path / "src")
+    assert fresh_runtime.config() == {"gain": 4}
+
+
+def test_no_config_anywhere_gives_the_default(tmp_path, monkeypatch, fresh_runtime):
+    monkeypatch.setattr(fresh_runtime, "here", lambda: tmp_path)
+    assert fresh_runtime.config(default={"a": 1}) == {"a": 1}
+
+
+# ---------------------------------------------------------------------------
+# the Julia backend, against stand-ins for juliapkg and juliacall
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def fake_julia(monkeypatch):
+    """juliapkg and juliacall stand-ins that record the order things happen in."""
+    events = []
+    juliapkg = types.ModuleType("juliapkg")
+    juliapkg.add = lambda name, uuid, version=None: events.append(("add", name, version))
+    juliapkg.require_julia = lambda compat: events.append(("julia", compat))
+    juliapkg.resolve = lambda: events.append(("resolve",))
+
+    class Main:
+        @staticmethod
+        def include(path):
+            events.append(("include", path))
+            Main.Backend = types.SimpleNamespace(
+                build=lambda payload: types.SimpleNamespace(
+                    matrix=[[1, 2], [3, 4]], echoed=json.loads(payload)))
+
+    class Juliacall(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+        """Makes `import juliacall` a recorded event: that is when Julia starts."""
+
+        def find_spec(self, name, path=None, target=None):
+            return importlib.util.spec_from_loader(name, self) if name == "juliacall" else None
+
+        def create_module(self, spec):
+            return None
+
+        def exec_module(self, module):
+            events.append(("start",))
+            module.Main = Main
+
+    monkeypatch.setitem(sys.modules, "juliapkg", juliapkg)
+    monkeypatch.delitem(sys.modules, "juliacall", raising=False)
+    monkeypatch.setattr(sys, "meta_path", [Juliacall()] + sys.meta_path)
+    return events
+
+
+def test_packages_are_declared_before_julia_starts(tmp_path, monkeypatch, fake_julia,
+                                                   fresh_runtime):
+    write(tmp_path / "backend.jl", "module Backend\nusing JSON3\nend\n")
+    monkeypatch.setattr(fresh_runtime, "here", lambda: tmp_path)
+    backend = fresh_runtime.load_julia_backend(
+        "backend.jl", packages=[("JSON3", "0f8b85d8-7281-11e9-16c2-39a750bddbf1", "1")],
+        julia_version="1.11")
+    assert fake_julia == [("julia", "1.11"), ("add", "JSON3", "1"), ("resolve",), ("start",),
+                          ("include", str((tmp_path / "backend.jl").resolve()))]
+
+    result = fresh_runtime.call_json(backend.build, {"n": np.int64(3), "x": np.ones(2)})
+    assert result.echoed == {"n": 3, "x": [1.0, 1.0]}
+    assert fresh_runtime.as_arrays(result, ["matrix"])["matrix"].dtype == float
+
+    assert fresh_runtime.load_julia_backend("backend.jl") is backend
+
+
+def test_the_bundles_packages_are_the_default(tmp_path, monkeypatch, fake_julia,
+                                              fresh_runtime):
+    write(tmp_path / "backend.jl", "module Backend\nend\n")
+    write(tmp_path / "robotarium_bundle.py",
+          "JULIA = {'version': None, 'packages': [{'name': 'JSON3', 'uuid': 'u', "
+          "'version': None}]}\n")
+    monkeypatch.setattr(fresh_runtime, "here", lambda: tmp_path)
+    fresh_runtime.load_julia_backend("backend.jl")
+    assert ("add", "JSON3", None) in fake_julia
+
+
+def test_a_missing_backend_file_says_to_upload_it(tmp_path, monkeypatch, fresh_runtime):
+    monkeypatch.setattr(fresh_runtime, "here", lambda: tmp_path)
+    with pytest.raises(fresh_runtime.JuliaBackendError, match="Upload it"):
+        fresh_runtime.load_julia_backend("backend.jl")
+
+
+def test_the_module_name_is_read_from_the_source(fresh_runtime):
+    assert fresh_runtime.julia_module_name("# c\nmodule SheafBackend\nend") == "SheafBackend"
+    assert fresh_runtime.julia_module_name("f(x) = x") is None

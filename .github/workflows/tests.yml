@@ -1,0 +1,65 @@
+name: Tests
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # pyproject requires >= 3.11 (tomllib). The runtime module that travels to the testbed
+        # is kept 3.10-compatible separately; see the job below.
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install, with the simulator
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e ".[sim,test]"
+
+    - name: Test
+      run: pytest
+
+    # The commands a person types, end to end, short of the network.
+    - name: Scaffold, check, simulate and dry-run a submission
+      run: |
+        robotarium --help
+        robotarium init "$RUNNER_TEMP/demo"
+        sed -i 's/iterations = 1500/iterations = 200/' "$RUNNER_TEMP/demo/robotarium.toml"
+        robotarium check "$RUNNER_TEMP/demo"
+        robotarium simulate "$RUNNER_TEMP/demo"
+        robotarium submit "$RUNNER_TEMP/demo" --dry-run
+
+  runtime-on-python-3-10:
+    # robotarium_runtime.py runs on the testbed's interpreter, not the one that built the bundle.
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.10"
+    - name: Import and exercise the runtime on 3.10
+      working-directory: src
+      run: |
+        pip install numpy
+        python - <<'PY'
+        import tempfile
+        import robotarium_runtime as rt
+        log = rt.RunLogger("ci", directory=tempfile.mkdtemp(), save_at_exit=False)
+        log.record(x=[1, 2])
+        log.note("ok")
+        print(rt.load_run(log.save()))
+        print(rt.config(default={"ok": True}))
+        PY
