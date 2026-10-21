@@ -128,7 +128,7 @@ started, file included. It then prints the module and what it exports. The first
 Julia and the packages into your environment, which takes a few minutes.
 
 ```bash
-pip install "robotarium[julia]"     # juliacall, which brings juliapkg
+pip install -e ".[julia]"     # in your clone, venv active: juliacall, which brings juliapkg
 robotarium julia check
 ```
 
@@ -142,9 +142,9 @@ declared packages are installed when the experiment starts, which needs the test
 Julia's package servers. If `load_julia_backend` fails there, the message distinguishes a package
 that couldn't be installed from a `.jl` file that couldn't be loaded.
 
-Installing takes time at the start of a run. Leave headroom in the estimated duration, or use
-`duration = "auto"`, which measures the robots' steps but not Julia's startup. The testbed's
-clock may start before the robots move, so err on the long side.
+Installing takes time at the start of a run. The default, `duration = "auto"`, declares the
+form's maximum of 600 s, which leaves the most room for it. `"measured"` counts the robots'
+steps but not Julia's startup, so with that or a fixed duration, err on the long side.
 
 ## The CONFIG pattern, for comparison
 

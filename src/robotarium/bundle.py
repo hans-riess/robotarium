@@ -31,6 +31,7 @@ import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import limits
 from ._version import __version__
 from .experiment import BUNDLE_MODULE, RUNTIME_MODULE, git_revision
 from .findings import errors
@@ -58,7 +59,8 @@ class Bundle:
         files (list): Their paths, in upload order: main first, generated modules last.
         title (str): The rendered title.
         description (str): The description.
-        duration: The estimated duration in seconds, or "auto" until a simulation settles it.
+        duration: The estimated duration in seconds ("auto" declares the form's maximum), or
+            "measured" until a simulation settles it.
         robots (int): The number of robots.
         built_at (str): When, as an ISO timestamp.
         git (str): The commit the files come from, or None outside git.
@@ -149,10 +151,12 @@ def build(experiment, output_dir: Path, when: datetime.datetime = None) -> Bundl
         shutil.rmtree(directory)
     staging.rename(directory)
 
+    duration = limits.MAX_DURATION_SECONDS if experiment.duration == "auto" \
+        else experiment.duration
     return Bundle(directory=directory,
                   files=[directory / path.name for path in files + generated],
                   title=title, description=experiment.description,
-                  duration=experiment.duration, robots=experiment.robots, built_at=built_at,
+                  duration=duration, robots=experiment.robots, built_at=built_at,
                   git=git, generated=[path.name for path in generated])
 
 

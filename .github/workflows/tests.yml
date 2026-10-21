@@ -7,14 +7,25 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
 
     strategy:
       fail-fast: false
       matrix:
-        # pyproject requires >= 3.11 (tomllib). The runtime module that travels to the testbed
-        # is kept 3.10-compatible separately; see the job below.
+        # pyproject requires >= 3.11 (tomllib). Every version on Linux; one on macOS, where the
+        # keyring backend and process handling differ. Windows is not supported yet:
+        # hans-riess/robotarium#2 says what its first run found and how to add it back. The
+        # runtime module that travels to the testbed is kept 3.10-compatible separately; see
+        # the job below.
+        os: [ubuntu-latest]
         python-version: ["3.11", "3.12", "3.13"]
+        include:
+          - os: macos-latest
+            python-version: "3.12"
+
+    defaults:
+      run:
+        shell: bash
 
     steps:
     - uses: actions/checkout@v4
@@ -32,15 +43,16 @@ jobs:
     - name: Test
       run: pytest
 
-    # The commands a person types, end to end, short of the network.
-    - name: Scaffold, check, simulate and dry-run a submission
+    # The commands a person types, end to end, short of the network: the README's walkthrough.
+    - name: Init, check, simulate and dry-run the two-robot example
+      env:
+        MPLBACKEND: Agg
       run: |
         robotarium --help
-        robotarium init "$RUNNER_TEMP/demo"
-        sed -i 's/iterations = 1500/iterations = 200/' "$RUNNER_TEMP/demo/robotarium.toml"
-        robotarium check "$RUNNER_TEMP/demo"
-        robotarium simulate "$RUNNER_TEMP/demo"
-        robotarium submit "$RUNNER_TEMP/demo" --dry-run
+        robotarium init "$RUNNER_TEMP/try_robotarium" --example two_robots
+        robotarium check "$RUNNER_TEMP/try_robotarium"
+        robotarium simulate "$RUNNER_TEMP/try_robotarium"
+        robotarium submit "$RUNNER_TEMP/try_robotarium" --dry-run
 
   runtime-on-python-3-10:
     # robotarium_runtime.py runs on the testbed's interpreter, not the one that built the bundle.

@@ -26,6 +26,7 @@ module. docs/site-api.md says how it was read and how to re-read it.
 Standard library only: urllib honours HTTPS_PROXY and the system's certificate store on its own.
 """
 
+import http.client
 import json
 import logging
 import mimetypes
@@ -52,7 +53,30 @@ log = logging.getLogger(__name__)
 
 
 class RobotariumError(RuntimeError):
-    """The site refused a request, with the reason it gave. Never carries the credentials."""
+    """
+    The site refused a request, with the reason it gave. Never carries the credentials.
+
+    Args:
+        message (str): What happened.
+        status (int): The HTTP status the site answered with, when it answered with one.
+        uncertain (bool): Whether the site may have done what was asked anyway -- an answer
+            lost, a gateway's 5xx, a success that does not say what it made.
+    """
+
+    def __init__(self, message: str, status: int = None, uncertain: bool = None):
+        super().__init__(message)
+        self.status = status
+        self.uncertain = bool(uncertain) if uncertain is not None else (status or 0) >= 500
+
+
+class ConnectionLost(RobotariumError):
+    """
+    A request was sent and no answer came back: the connection dropped or timed out. Unlike a
+    refusal, the site may have acted on it -- an experiment may exist although create failed.
+    """
+
+    def __init__(self, message: str):
+        super().__init__(message, uncertain=True)
 
 
 def api_url() -> str:
@@ -90,8 +114,14 @@ class RobotariumClient:
             password (str): The password in the clear; it leaves here encrypted, as the page
                 sends it.
         """
+        try:
+            encrypted = encrypt_password(password)
+        except UnicodeEncodeError:
+            # The error would quote the character; the message names the problem only.
+            raise RobotariumError("The password is not valid text (it holds bytes that are not "
+                                  "UTF-8).") from None
         reply = self._request("POST", "auth/login",
-                              body={"email": email, "password": encrypt_password(password)})
+                              body={"email": email, "password": encrypted})
         if not reply.get("token"):
             raise RobotariumError("Login refused: %s" % _reason(reply, "no token in the reply"))
         self.token = reply["token"]
@@ -122,9 +152,12 @@ class RobotariumClient:
             form (dict): What experiment_form returns.
         """
         reply = self._request("POST", "experiment/create", body=form)
-        if reply.get("status") == "error" or not reply.get("experimentId"):
-            raise RobotariumError("Experiment refused: %s"
-                                  % _reason(reply, "no experimentId in the reply"))
+        if reply.get("status") == "error":
+            raise RobotariumError("Experiment refused: %s" % _reason(reply, "no reason"))
+        if not reply.get("experimentId"):
+            # Answered, without an error and without an id: whether it made one is unknown.
+            raise RobotariumError("The site answered without an experiment id: %s"
+                                  % _reason(reply, "no message"), uncertain=True)
         return reply["experimentId"]
 
     def mark_main_file(self, main_file_id: str, file_ids: list, experiment_id: str) -> None:
@@ -171,10 +204,22 @@ class RobotariumClient:
                 log.debug("%s %s -> HTTP %d", method, path, response.status)
         except urllib.error.HTTPError as error:
             log.debug("%s %s -> HTTP %d", method, path, error.code)
+            try:
+                reply = _decode(error.read())
+            except (OSError, http.client.HTTPException):
+                reply = {}  # an error page cut off or stalled: the status is the answer
             raise RobotariumError("%s %s answered HTTP %d: %s" % (
-                method, path, error.code, _reason(_decode(error.read()), error.reason))) from None
+                method, path, error.code, _reason(reply, error.reason)), status=error.code) \
+                from None
         except urllib.error.URLError as error:
             raise RobotariumError("Could not reach %s: %s" % (self.url, error.reason)) from None
+        except http.client.InvalidURL as error:
+            raise RobotariumError("%s is not a usable API URL: %s" % (self.url, error)) from None
+        except (OSError, http.client.HTTPException) as error:
+            # Raised from reading the reply, which urllib does not wrap: the request went out.
+            log.debug("%s %s -> no answer (%s)", method, path, type(error).__name__)
+            raise ConnectionLost("%s %s got no answer: %s" % (
+                method, path, str(error) or type(error).__name__)) from None
 
         return _decode(payload)
 

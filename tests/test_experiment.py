@@ -1,6 +1,7 @@
 """The experiment's fields and files, and reading them from robotarium.toml."""
 
 import datetime
+import os
 
 import pytest
 
@@ -13,6 +14,7 @@ from conftest import write
 @pytest.mark.parametrize("given, seconds", [
     (90, 90), (89.2, 90), ("90", 90), ("90s", 90), ("2m", 120), ("1m30s", 90),
     ("1.5 min", 90), ("2 minutes", 120), ("45 sec", 45), ("auto", "auto"), ("AUTO", "auto"),
+    ("measured", "measured"),
 ])
 def test_durations_are_read_as_whole_seconds(given, seconds):
     assert parse_duration(given) == seconds
@@ -179,7 +181,7 @@ def test_a_misspelt_key_fails_loudly(tmp_path):
 
 def test_a_missing_field_is_named(tmp_path):
     write(tmp_path / "robotarium.toml", '[experiment]\ntitle = "x"\nmain = "main.py"\n')
-    with pytest.raises(ValueError, match="duration, robots, description"):
+    with pytest.raises(ValueError, match="robots, description"):
         load_project(tmp_path)
 
 
@@ -202,3 +204,39 @@ def test_a_config_that_is_not_plain_data_is_an_error(tmp_path):
 def test_a_matlab_main_file_is_accepted(tmp_path):
     write(tmp_path / "main.m", "r = Robotarium('NumberOfRobots', 4);\n")
     assert errors(experiment(tmp_path, main="main.m").check()) == []
+
+
+def test_globs_work_under_a_directory_with_brackets(tmp_path):
+    root = tmp_path / "exp[1]"
+    write(root / "data" / "a.npy", "")
+    paths = experiment(root, files=["data/*.npy"]).upload_files()
+    assert [path.name for path in paths] == ["main.py", "a.npy"]
+
+
+def test_an_existing_file_under_brackets_is_a_file_not_a_pattern(tmp_path):
+    root = tmp_path / "exp[1]"
+    write(root / "data.npy", "")
+    found = experiment(root, files=[str((root / "data.npy").resolve())])
+    assert [path.name for path in found.upload_files()] == ["main.py", "data.npy"]
+    assert not [each for each in found.check() if "matches no files" in each.message]
+
+
+def test_a_home_glob_does_not_read_the_home_directory_as_a_pattern(tmp_path, monkeypatch):
+    home = tmp_path / "home[me]"
+    write(home / "data" / "a.npy", "")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))     # what ~ means on Windows
+    for entry in ("~/data/*.npy", "~" + os.sep + "data" + os.sep + "*.npy"):
+        paths = experiment(tmp_path, files=[entry]).upload_files()
+        assert [path.name for path in paths] == ["main.py", "a.npy"]
+
+
+def test_duration_may_be_left_out_and_is_then_auto(tmp_path):
+    write(tmp_path / "robotarium.toml", '[experiment]\ntitle = "t"\ndescription = "d"\n'
+                                        'robots = 2\nmain = "main.py"\n')
+    write(tmp_path / "main.py", "")
+    assert load_project(tmp_path).experiment.duration == "auto"
+
+
+def test_measured_is_a_duration(tmp_path):
+    assert errors(experiment(tmp_path, duration="measured").check()) == []

@@ -16,6 +16,7 @@ import tomllib
 import urllib.error
 import urllib.request
 
+from .credentials import PASSWORD_VARIABLE, USERNAME_VARIABLE
 from .experiment import JuliaPackage
 
 #: The General registry, raw. ROBOTARIUM_JULIA_REGISTRY overrides it (a mirror, or a stand-in
@@ -108,9 +109,11 @@ def check(bundle, julia_file: str = None, python: str = None, timeout: float = 1
         raise JuliaToolError("The bundle does not carry robotarium_runtime.py: import it from "
                              "the main file, or set [experiment] runtime = true.")
 
+    environment = {key: value for key, value in os.environ.items()
+                   if key not in (USERNAME_VARIABLE, PASSWORD_VARIABLE)}
     completed = subprocess.run([python or sys.executable, "-c", _CHECK_SCRIPT, julia_file],
-                               cwd=bundle.directory, capture_output=True, text=True,
-                               timeout=timeout)
+                               cwd=bundle.directory, env=environment, capture_output=True,
+                               text=True, timeout=timeout)
     for line in completed.stdout.splitlines():
         if line.startswith("ROBOTARIUM_JULIA_CHECK "):
             return json.loads(line[len("ROBOTARIUM_JULIA_CHECK "):])

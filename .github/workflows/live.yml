@@ -1,0 +1,31 @@
+name: Live test
+
+# Submits the two-robot example to the REAL Robotarium as a draft (saved, not queued), to check
+# that the site still answers the way src/robotarium/client.py expects. Run by hand only:
+# Actions -> Live test -> Run workflow. Needs the repository secrets ROBOTARIUM_USERNAME and
+# ROBOTARIUM_PASSWORD; delete the draft from the Robotarium dashboard afterwards.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install, with the simulator
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e ".[sim,test]"
+
+    - name: Log in and submit the example as a draft
+      env:
+        ROBOTARIUM_LIVE_TEST: "1"
+        ROBOTARIUM_USERNAME: ${{ secrets.ROBOTARIUM_USERNAME }}
+        ROBOTARIUM_PASSWORD: ${{ secrets.ROBOTARIUM_PASSWORD }}
+      run: pytest -m live -v -s

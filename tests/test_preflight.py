@@ -167,6 +167,41 @@ def test_a_declared_but_unused_package_is_noted(tmp_path):
     assert "no uploaded .jl file loads it" in messages(found, INFO)
 
 
+@pytest.mark.parametrize("source, expected", [
+    ("using LinearAlgebra; using JSON3", ["LinearAlgebra", "JSON3"]),
+    ("using CSV,\n    DataFrames\n", ["CSV", "DataFrames"]),
+    ("import JSON3\tas J", ["JSON3"]),
+    ("import Foo.Bar: baz, qux", ["Foo"]),
+    ("using A: f,\n    g\nusing B", ["A", "B"]),
+    ("x = 1  # using Trailing\n", []),
+    ('@warn "No GPU found; using CPU instead"\nusing JSON3', ["JSON3"]),
+    ('pyexec("import numpy as np; import scipy.linalg as sl", Main)', []),
+    ('const LABEL = "robot, #"\nusing JSON3', ["JSON3"]),
+    ("using CSV,\n\n    # a comment\n    DataFrames", ["CSV", "DataFrames"]),
+    ("@everywhere using Distributed", ["Distributed"]),
+    ("using Ünïcode", ["Ünïcode"]),
+    ("x = A'; using B", ["B"]),
+    ("c = ';'; using D", ["D"]),
+    ('s = """\nusing NotReal; x\n"""\nusing E', ["E"]),
+    ("#= outer #= inner =# using F =#\nusing G", ["G"]),
+    ('x = "$(f("a;b")) ; using X"\nusing Y', ["Y"]),
+    ('x = "$(g("#")) not a comment" ; using Z', ["Z"]),
+    ('"$(f("$(g("x;y"))"))"; using V', ["V"]),
+    ('s = "a \\" ; using Q"\nusing R', ["R"]),
+    ("c = '\"'; using D", ["D"]),
+    ('r = raw"a\\\\"; using H', ["H"]),
+])
+def test_julia_statement_forms_are_parsed(source, expected):
+    assert julia_packages_used(source) == expected
+
+
+def test_a_second_using_on_a_line_is_not_missed(tmp_path):
+    found = findings_for(tmp_path, LOADER,
+                         files={"backend.jl": "using LinearAlgebra; using JSON3\n"})
+    assert "loads JSON3" in messages(found, ERROR)
+    assert "LinearAlgebra" not in messages(found, ERROR)
+
+
 def test_julia_usings_are_parsed():
     source = """
     module SheafBackend
@@ -180,3 +215,74 @@ def test_julia_usings_are_parsed():
     """
     assert julia_packages_used(source) == ["CellularSheaves", "JSON3", "LinearAlgebra",
                                            "Statistics"]
+
+
+def test_an_rps_folder_beside_the_main_file_is_not_a_problem(tmp_path):
+    write(tmp_path / "rps" / "__init__.py", "")
+    assert messages(findings_for(tmp_path), ERROR) == ""
+
+
+def test_the_stdlib_is_the_testbeds(tmp_path):
+    found = findings_for(tmp_path, GOOD_MAIN + "import tomllib\nimport imp\nimport distutils\n")
+    assert "tomllib is not in the standard library of Python 3.10" in messages(found, WARNING)
+    assert "imp" not in messages(found, WARNING).replace("import", "")
+    assert "distutils" not in messages(found, WARNING)
+
+
+def test_skipping_initialization_is_warned_about(tmp_path):
+    main = GOOD_MAIN.replace("show_figure=False", "show_figure=False, skip_initialization=True")
+    assert "skip_initialization" in messages(findings_for(tmp_path, main), WARNING)
+
+
+def test_a_version_guarded_import_is_optional(tmp_path):
+    main = GOOD_MAIN + ("import sys\nif sys.version_info >= (3, 11):\n    import tomllib\n"
+                        "else:\n    import tomli as tomllib\n")
+    assert messages(findings_for(tmp_path, main), WARNING) == ""
+
+
+def test_includes_are_read_from_code_only(tmp_path):
+    from robotarium.preflight import julia_includes
+    source = ('# include("old.jl")\n"""\ninclude("doc.jl")\n"""\n#= include("x.jl") =#\n'
+              'include("ops.jl")\ninclude( "lib/util.jl" )\n')
+    assert julia_includes(source) == ["ops.jl", "lib/util.jl"]
+    found = findings_for(tmp_path, LOADER, files={"backend.jl": "# include(\"old.jl\")\n"})
+    assert messages(found, ERROR) == ""
+
+
+def test_the_julia_scanner_is_linear(tmp_path):
+    import time
+    from robotarium.preflight import julia_code
+    source = "x = 'a'; y = \"s\"\n" * 40000
+    started = time.time()
+    assert len(julia_code(source)) == len(source)
+    assert time.time() - started < 5
+
+
+@pytest.mark.parametrize("guarded, warned", [
+    ("if sys.version_info >= (3, 11):\n    import tomllib\nelse:\n    import pandas\n",
+     "pandas"),
+    ("if sys.version_info < (3, 11):\n    import tomllib\n", "tomllib"),
+    ("if sys.version_info[:2] >= (3, 11):\n    import tomllib\n", None),
+    ("if (3, 11) <= sys.version_info:\n    import tomllib\n", None),
+])
+def test_the_branch_the_testbed_takes_is_checked(tmp_path, guarded, warned):
+    found = messages(findings_for(tmp_path, GOOD_MAIN + "import sys\n" + guarded), WARNING)
+    if warned:
+        assert warned in found
+    else:
+        assert found == ""
+
+
+
+@pytest.mark.parametrize("include", ['"./ops.jl"', '"$(@__DIR__)/ops.jl"', '"$(name).jl"',
+                                     '".\\\\ops.jl"'])
+def test_include_paths_that_name_the_file_beside_are_accepted(tmp_path, include):
+    found = findings_for(tmp_path, LOADER, files={"backend.jl": "include(%s)\n" % include,
+                                                  "ops.jl": ""})
+    assert messages(found, ERROR) == ""
+
+
+def test_an_include_from_a_subdirectory_is_still_an_error(tmp_path):
+    found = findings_for(tmp_path, LOADER, files={"backend.jl": 'include("./lib/ops.jl")\n',
+                                                  "ops.jl": ""})
+    assert "include it by base name" in messages(found, ERROR)

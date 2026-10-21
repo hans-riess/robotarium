@@ -51,7 +51,7 @@ dir = ".robotarium"
 | `title` | yes | The form's **Title**. Placeholders are filled when the bundle is built: `{date}` (2026-10-21), `{time}` (15:31), `{timestamp}` (20261021T1531), `{git}` (short commit, `-dirty` if changed), `{robots}`, `{main}` (the main file's stem). Write `{{` and `}}` for literal braces. |
 | `description` | one of | The form's **Experiment Description**. |
 | `description_file` | one of | ...or a text file to read it from, relative to the manifest. |
-| `duration` | yes | The form's **Estimated Duration**: seconds (`120`), or `"90s"`, `"2m"`, `"1m30s"`, `"1.5 min"`. Rounded up to whole seconds. Must be 1-600. `"auto"` measures it with a simulator run (see below). |
+| `duration` | no | The form's **Estimated Duration**. `"auto"` (the default) declares the form's maximum, 600 s. Or give seconds (`120`), `"90s"`, `"2m"`, `"1m30s"` or `"1.5 min"`, rounded up to whole seconds, from 1 to 600. Or `"measured"` takes it from a simulator run (see below). |
 | `robots` | yes | The form's **Number of Robots**, 1-18. Checked against `Robotarium(number_of_robots=...)` in the main file, statically and in simulation. |
 | `main` | yes | The **Main File**: a `.py`, or a MATLAB `.m`. |
 | `files` | no | Supporting files, relative to the manifest. Globs work (`"data/*.npy"`, `"**/*.py"`). The main file may be listed or not. |
@@ -69,11 +69,15 @@ directory.
 .mexmaci64 .jpg .jpeg .png .gif .tiff .bmp`. That leaves out `.json`, `.yaml`, `.toml`, `.txt`
 and `.zip`, which is why configuration travels as Python (next section).
 
-**`duration = "auto"`.** The testbed advances at a fixed 0.033 s per `Robotarium.step()`, whatever
-your own time step says. `"auto"` runs the main file in the simulator, counts the steps (the drive
-to the initial poses included), adds a quarter for headroom, and rounds up to the minute. The
-testbed stops a run that outlasts its declared duration, and over-declaring costs nothing. With a
-fixed duration, a `--simulate` run checks that it's long enough.
+**`duration`.** The testbed stops a run that outlasts its declared duration, and declaring more
+than the run needs costs nothing, since the run ends when the main file does. So by default,
+`"auto"`, an experiment declares the form's maximum of 600 s, or the site's own maximum if
+`submit` finds that lower. When you'd rather declare close to what the run takes, for example to
+fit a queue that schedules by declared time, `"measured"` takes it from a simulator run. The
+testbed advances at a fixed 0.033 s per `Robotarium.step()`, whatever your own time step says, so
+`"measured"` counts the steps (the drive to the initial poses included), adds a quarter for
+headroom, and rounds up to the minute. With a fixed duration, a `--simulate` run checks that it's
+long enough.
 
 ## `[config]`: parameters that travel with the experiment
 
@@ -115,7 +119,7 @@ entry. See [julia.md](julia.md).
 | Key | Default | Meaning |
 |---|---|---|
 | `draft` | `false` | Save the experiment on the site (the form's **Save Experiment**) rather than queue it (**Submit Experiment**). `--draft` and `--queue` override it. |
-| `simulate` | `false` | Run the simulator before submitting, and refuse on any error it finds. `--simulate` and `--no-simulate` override it. A duration of `"auto"` always simulates. |
+| `simulate` | `false` | Run the simulator before submitting, and refuse on any error it finds. `--simulate` and `--no-simulate` override it. A duration of `"measured"` always simulates. |
 
 ## `[output]`
 

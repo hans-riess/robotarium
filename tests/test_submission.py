@@ -10,6 +10,7 @@ import json
 import pytest
 
 from robotarium import ledger
+from robotarium.client import ConnectionLost, RobotariumClient, RobotariumError
 from robotarium.experiment import Experiment, Project
 from robotarium.submission import SubmissionRefused, submit
 
@@ -147,8 +148,8 @@ def test_the_sites_live_limits_refuse_before_uploading(project, fake_site, logge
     assert "/api/files/upload" not in [each["path"] for each in fake_site]
 
 
-def test_auto_without_a_simulation_is_refused(project, fake_site, logged_in):
-    project.experiment.duration = "auto"
+def test_measured_without_a_simulation_is_refused(project, fake_site, logged_in):
+    project.experiment.duration = "measured"
     with pytest.raises(SubmissionRefused, match="only a simulation"):
         submit(project, simulate_first=False, confirm=False, out=lambda *_: None)
 
@@ -162,3 +163,126 @@ def test_a_matlab_main_file_is_not_simulated(tmp_path, fake_site, logged_in):
     result = submit(experiment, confirm=False, out=lambda *_: None)
     uploads = [each["filename"] for each in fake_site if each["path"] == "/api/files/upload"]
     assert result.sent and uploads == ["main.m"]
+
+
+# ---------------------------------------------------------------------------
+# failures part-way through: always recorded, and what they leave on the site named
+# ---------------------------------------------------------------------------
+
+def test_a_dropped_create_is_recorded_as_possibly_created(project, fake_site, logged_in,
+                                                          monkeypatch):
+    monkeypatch.setattr(FakeRobotarium, "drop", "/api/experiment/create")
+    with pytest.raises(RobotariumError, match="may have been created") as error:
+        submit(project, confirm=False, out=lambda *_: None)
+    assert isinstance(error.value, ConnectionLost)
+    entry = ledger.read(project.output_dir)[-1]
+    assert (entry["outcome"], entry["stage"]) == ("failed", "create")
+    assert "check" in entry["consequence"] and "got no answer" in entry["error"]
+
+
+def test_a_refused_main_file_mark_names_the_created_experiment(project, fake_site, logged_in,
+                                                               monkeypatch):
+    monkeypatch.setattr(FakeRobotarium, "mark_main_reply",
+                        {"status": "error", "message": "no such file"})
+    with pytest.raises(RobotariumError, match="Experiment exp-1 was created"):
+        submit(project, confirm=False, out=lambda *_: None)
+    entry = ledger.read(project.output_dir)[-1]
+    assert (entry["stage"], entry["experiment_id"]) == ("mark-main", "exp-1")
+
+
+def test_an_interrupted_upload_is_recorded(project, fake_site, logged_in, monkeypatch):
+    real_upload = RobotariumClient.upload_file
+    calls = []
+
+    def upload(self, path):
+        calls.append(path)
+        if len(calls) == 2:
+            raise KeyboardInterrupt
+        return real_upload(self, path)
+
+    monkeypatch.setattr(RobotariumClient, "upload_file", upload)
+    printed = []
+    with pytest.raises(KeyboardInterrupt):
+        submit(project, confirm=False, out=printed.append)
+    entry = ledger.read(project.output_dir)[-1]
+    assert (entry["outcome"], entry["stage"], entry["orphaned_uploads"]) == \
+        ("interrupted", "upload", 1)
+    assert entry["error"] == "KeyboardInterrupt"
+    assert any("1 file(s) were uploaded, and one more may have been" in line for line in printed)
+
+
+def test_a_gateway_error_at_create_is_ambiguous_not_orphaned(project, fake_site, logged_in,
+                                                              monkeypatch):
+    def gateway(self, form):
+        raise RobotariumError("POST experiment/create answered HTTP 504: Gateway Timeout",
+                              status=504)
+
+    monkeypatch.setattr(RobotariumClient, "create_experiment", gateway)
+    with pytest.raises(RobotariumError, match="may have been created"):
+        submit(project, confirm=False, out=lambda *_: None)
+    entry = ledger.read(project.output_dir)[-1]
+    assert entry["orphaned_uploads"] == 0 and "may have been created" in entry["consequence"]
+
+
+def test_a_cut_off_error_page_is_still_a_clean_error(project, fake_site, logged_in,
+                                                     monkeypatch):
+    import http.client
+    import urllib.error
+
+    class CutOff(urllib.error.HTTPError):
+        def read(self, *arguments):
+            raise http.client.IncompleteRead(b"partial")
+
+    def respond(request, timeout=None):
+        raise CutOff(request.full_url, 502, "Bad Gateway", {}, None)
+
+    monkeypatch.setattr("urllib.request.urlopen", respond)
+    with pytest.raises(RobotariumError, match="HTTP 502: Bad Gateway") as error:
+        RobotariumClient().settings()
+    assert error.value.status == 502
+
+
+def test_an_unexpected_errors_text_stays_out_of_the_ledger(project, fake_site, logged_in,
+                                                           monkeypatch):
+    def choke(self, email, password):
+        raise UnicodeEncodeError("utf-8", "pass\udcffword", 4, 5, "surrogates not allowed")
+
+    monkeypatch.setattr(RobotariumClient, "login", choke)
+    with pytest.raises(UnicodeEncodeError):
+        submit(project, confirm=False, out=lambda *_: None)
+    entry = ledger.read(project.output_dir)[-1]
+    assert entry["error"] == "UnicodeEncodeError" and "word" not in json.dumps(entry)
+
+
+
+def test_a_create_reply_without_an_id_is_uncertain(project, fake_site, logged_in, monkeypatch):
+    monkeypatch.setattr(FakeRobotarium, "create_reply", {"message": "ok"})
+    with pytest.raises(RobotariumError, match="may have been created") as error:
+        submit(project, confirm=False, out=lambda *_: None)
+    assert error.value.uncertain
+    assert ledger.read(project.output_dir)[-1]["orphaned_uploads"] == 0
+
+
+def test_an_explicit_refusal_at_create_leaves_orphaned_uploads(project, fake_site, logged_in,
+                                                              monkeypatch):
+    monkeypatch.setattr(FakeRobotarium, "create_reply", {"status": "error", "message": "no"})
+    with pytest.raises(RobotariumError, match="attached to no experiment"):
+        submit(project, confirm=False, out=lambda *_: None)
+    assert ledger.read(project.output_dir)[-1]["orphaned_uploads"] == 4
+
+
+
+def test_auto_declares_the_maximum_and_follows_a_lower_live_one(project, fake_site, logged_in,
+                                                                monkeypatch):
+    project.experiment.duration = "auto"
+    result = submit(project, confirm=False, out=lambda *_: None)
+    create = next(each["json"] for each in fake_site if each["path"].endswith("create"))
+    assert create["estimatedDuration"] == "600" and result.prepared.report is None
+
+    fake_site.clear()
+    monkeypatch.setattr(FakeRobotarium, "settings", {**FakeRobotarium.settings,
+                                                     "maxDuration": 300})
+    submit(project, confirm=False, out=lambda *_: None)
+    create = next(each["json"] for each in fake_site if each["path"].endswith("create"))
+    assert create["estimatedDuration"] == "300"
+    assert ledger.read(project.output_dir)[-1]["duration"] == 300

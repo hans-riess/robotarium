@@ -20,8 +20,10 @@ manifest, from flags alone: --title, --description, --duration, --robots, --main
 
 import argparse
 import getpass
+import glob
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -73,8 +75,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     command = commands.add_parser("init", help="write a new experiment that runs as it stands")
     command.add_argument("directory", type=Path, nargs="?", default=Path("."))
-    command.add_argument("--julia", action="store_true", help="with a backend.jl, loaded the "
-                                                              "robosheaf way")
+    kind = command.add_mutually_exclusive_group()
+    kind.add_argument("--julia", action="store_true", help="with a backend.jl, loaded the "
+                                                           "robosheaf way")
+    kind.add_argument("--example", choices=scaffold.examples(), metavar="NAME",
+                      help="a ready-made example to try the CLI on: %s"
+                           % ", ".join(scaffold.examples()))
     command.add_argument("--robots", type=int, default=4, help="number of robots (default 4)")
     command.add_argument("--title", help="the experiment's title (default from the directory)")
     command.add_argument("--force", action="store_true", help="overwrite files that exist")
@@ -104,7 +110,9 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--title")
     group.add_argument("--description")
     group.add_argument("--description-file", type=Path, metavar="FILE")
-    group.add_argument("--duration", help="seconds, \"90s\", \"2m\", or \"auto\"")
+    group.add_argument("--duration", help="seconds, \"90s\", \"2m\"; \"auto\" (the form's "
+                                          "maximum, 600 s; the default) or \"measured\" (from a "
+                                          "simulator run)")
     group.add_argument("--robots", type=int)
     group.add_argument("--main", type=Path, metavar="FILE")
     group.add_argument("--file", type=Path, action="append", default=[], dest="files",
@@ -212,16 +220,24 @@ def configure_logging(verbose: bool, log_file: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def run_init(arguments) -> int:
-    written = scaffold.create(arguments.directory, julia=arguments.julia,
-                              robots=arguments.robots, title=arguments.title,
-                              force=arguments.force)
+    if arguments.example:
+        written = scaffold.create_example(arguments.example, arguments.directory,
+                                          force=arguments.force)
+    else:
+        written = scaffold.create(arguments.directory, julia=arguments.julia,
+                                  robots=arguments.robots, title=arguments.title,
+                                  force=arguments.force)
     for path, fresh in written:
         print("  %s %s" % ("wrote  " if fresh else "kept   ", path))
     directory = arguments.directory
-    print("\nNext:\n  cd %s\n  robotarium simulate --show    # needs the simulator: see "
-          "docs/simulator.md\n  robotarium submit --dry-run" % directory)
+    print("\nNext:\n  cd %s\n  robotarium check\n  robotarium simulate --show    # needs the "
+          "simulator: see docs/simulator.md\n  robotarium submit --dry-run" % directory)
     if arguments.julia:
         print("  robotarium julia check        # load backend.jl here, as the testbed will")
+    if arguments.example:
+        print("  robotarium login              # once: keeps your Robotarium login safely\n"
+              "  robotarium submit             # saves it on the Robotarium as a DRAFT\n"
+              "  robotarium history")
     return 0
 
 
@@ -294,16 +310,17 @@ def project_for_submit(arguments) -> Project:
     if arguments.main is not None:
         overrides["main"] = arguments.main.resolve()
     if arguments.files:
-        overrides["files"] = [path.resolve() for path in arguments.files]
+        overrides["files"] = [from_here(path) for path in arguments.files]
     if arguments.config is not None:
         overrides["config"] = arguments.config.resolve()
 
     if find_manifest(arguments.project) is None and "main" in overrides:
         missing = [flag for flag, key in (("--title", "title"), ("--description", "description"),
-                                          ("--duration", "duration"), ("--robots", "robots"))
+                                          ("--robots", "robots"))
                    if key not in overrides]
         if missing:
             raise ValueError("Without a robotarium.toml, submit needs %s." % ", ".join(missing))
+        overrides.setdefault("duration", "auto")
         return Project(experiment=Experiment(root=Path.cwd(), **overrides))
 
     project = load_project(arguments.project)
@@ -312,6 +329,17 @@ def project_for_submit(arguments) -> Project:
         setattr(experiment, key, value)
     experiment.__post_init__()
     return project
+
+
+def from_here(path: Path) -> Path:
+    """
+    A --file argument as an absolute path, read from the current directory as the shell would.
+    A glob keeps its pattern but not the directory's: `--file "data/*.npy"` run from exp[1]/
+    must not read exp[1] as a pattern.
+    """
+    if not path.is_absolute() and glob.has_magic(str(path)) and not path.is_file():
+        return Path(os.path.join(glob.escape(os.getcwd()), str(path)))
+    return path.resolve()
 
 
 def apply_simulator_arguments(project: Project, arguments) -> Project:
@@ -358,6 +386,7 @@ def run_login(arguments) -> int:
     if not username or not password:
         print("Nothing stored.")
         return 1
+    credentials_module.check_text(email=username, password=password)
     if arguments.verify:
         RobotariumClient().login(username, password)
         print("Logged in: the credentials work.")

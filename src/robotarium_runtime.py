@@ -313,6 +313,13 @@ def _package_entry(package) -> tuple:
 # logging a run
 # ---------------------------------------------------------------------------
 
+#: Names np.savez_compressed takes as its own parameters, so a series cannot have them.
+_RESERVED = ("file", "allow_pickle")
+
+#: The paths RunLoggers in this process write to.
+_CLAIMED = set()
+
+
 class RunLogger:
     """
     Records a run step by step and writes it as one .npz file: an array per recorded quantity,
@@ -342,13 +349,22 @@ class RunLogger:
     def __init__(self, name="run", directory=None, meta=None, autosave_every=0,
                  save_at_exit=True, echo=True):
         self.started = datetime.datetime.now().astimezone()
-        directory = directory or os.environ.get(LOG_DIR_VARIABLE) or here()
-        self.path = Path(directory) / ("%s_%s.npz" % (name, self.started.strftime("%Y%m%d_%H%M%S")))
+        directory = Path(directory or os.environ.get(LOG_DIR_VARIABLE) or here())
+        stem = "%s_%s" % (name, self.started.strftime("%Y%m%d_%H%M%S"))
+        self.path = directory / ("%s.npz" % stem)
+        # Two loggers of one name started within a second must not write the same file.
+        number = 1
+        while self.path.resolve() in _CLAIMED or self.path.exists():
+            number += 1
+            self.path = directory / ("%s_%d.npz" % (stem, number))
+        _CLAIMED.add(self.path.resolve())
         self.autosave_every = int(autosave_every)
         self.echo = echo
         self._series = {}
         self._steps = {}
-        self._count = 0
+        self._next_step = 0
+        self._last_step = None
+        self._records = 0
         self._dirty = False
         built = bundle().get("experiment") or {}
         self.meta = {"name": name, "started_at": self.started.isoformat(timespec="seconds"),
@@ -364,22 +380,42 @@ class RunLogger:
         from step to step.
 
         Args:
-            step (int): The step this is; default one more than the last record() call's.
+            step (int): The step this is; default one more than the last step recorded.
             **values: Arrays or numbers, e.g. poses=x, velocities=dxu, error=0.12.
         """
-        step = self._count if step is None else int(step)
-        for key, value in values.items():
-            array = np.array(value, copy=True)
-            series = self._series.setdefault(key, [])
+        step = self._next_step if step is None else int(step)
+        arrays = {key: np.array(value, copy=True) for key, value in values.items()}
+        # Every value is checked before any is kept, so a refused record leaves no series a
+        # step longer than the others.
+        for key, array in arrays.items():
+            if key in _RESERVED or key.startswith("__"):
+                raise ValueError("RunLogger: %r is a name the file format reserves; record it "
+                                 "under another." % key)
+            # Objects in any form -- object arrays, structured dtypes with an object field,
+            # numpy 2's StringDType -- need pickling, and the file must load without it.
+            if array.dtype.hasobject or array.dtype.kind == "T":
+                raise ValueError("RunLogger: %r is not numbers or text. Record numbers, arrays "
+                                 "or strings; put anything else in meta." % key)
+            series = self._series.get(key)
             if series and series[0].shape != array.shape:
                 raise ValueError("RunLogger: %r was recorded with shape %s and now %s. Record "
                                  "a quantity with the same shape at every step."
                                  % (key, series[0].shape, array.shape))
-            series.append(array)
+            if series:
+                try:
+                    np.result_type(series[0].dtype, array.dtype)
+                except TypeError:
+                    raise ValueError("RunLogger: %r was recorded as %s and now as %s, which "
+                                     "cannot be kept as one array." % (
+                                         key, series[0].dtype, array.dtype)) from None
+        for key, array in arrays.items():
+            self._series.setdefault(key, []).append(array)
             self._steps.setdefault(key, []).append(step)
-        self._count = step + 1
+        self._next_step = step + 1
+        self._last_step = step
+        self._records += 1
         self._dirty = True
-        if self.autosave_every and self._count % self.autosave_every == 0:
+        if self.autosave_every and self._records % self.autosave_every == 0:
             self.save()
 
     def note(self, message: str, step=None) -> None:
@@ -388,9 +424,11 @@ class RunLogger:
 
         Args:
             message (str): The remark.
-            step (int): The step it is about; default the current one.
+            step (int): The step it is about; default the last one recorded (0 before any).
         """
-        step = self._count if step is None else int(step)
+        if step is None:
+            step = 0 if self._last_step is None else self._last_step
+        step = int(step)
         self.meta["notes"].append({"step": step, "seconds": round(step * STEP_SECONDS, 3),
                                    "message": str(message)})
         self._dirty = True
@@ -404,15 +442,22 @@ class RunLogger:
             arrays[key] = np.stack(series)
             arrays["__steps__" + key] = np.asarray(self._steps[key], dtype=np.int64)
         meta = dict(self.meta, saved_at=datetime.datetime.now().astimezone().isoformat(
-            timespec="seconds"), records=self._count)
+            timespec="seconds"), records=self._records)
         arrays["__meta__"] = np.array(json.dumps(meta, default=_jsonable))
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # Written aside and moved into place, so a run killed mid-write leaves the last
         # complete file rather than a truncated one.
         partial = self.path.with_name(self.path.name + ".partial")
-        with open(partial, "wb") as handle:
-            np.savez_compressed(handle, **arrays)
-        os.replace(partial, self.path)
+        try:
+            with open(partial, "wb") as handle:
+                np.savez_compressed(handle, **arrays)
+            os.replace(partial, self.path)
+        except BaseException:
+            try:
+                partial.unlink()
+            except OSError:
+                pass
+            raise
         self._dirty = False
         return self.path
 

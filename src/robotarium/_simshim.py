@@ -11,16 +11,20 @@ experiment ended with debug() or call_at_scripts_end(). It writes all of that as
 in $ROBOTARIUM_SIM_REPORT when the main file finishes, however it finishes.
 
 $ROBOTARIUM_SIM_FAST=1 turns off the simulator's real-time pacing, which changes how long the
-run takes to watch and nothing about what it does.
+run takes to watch and nothing about what it does. skip_initialization=True is overridden,
+since the testbed always drives the robots to their initial poses first. Past
+$ROBOTARIUM_SIM_MAX_STEPS steps the run is stopped: it could not be submitted anyway.
 """
 
 import atexit
 import json
 import os
 import runpy
+import signal
 import sys
 import time
 import traceback
+import warnings
 from pathlib import Path
 
 REPORT = {
@@ -32,10 +36,35 @@ REPORT = {
     "ended": False,
     "exception": None,
     "wall_seconds": None,
+    "skipped_initialization": False,
+    "too_long": False,
 }
 
 _INSTANCES = []
 _STARTED = time.time()
+
+#: Steps after which the run is stopped: past the form's maximum duration. 0 for no limit.
+MAX_STEPS = int(os.environ.get("ROBOTARIUM_SIM_MAX_STEPS") or 0)
+
+
+def stop_too_long() -> None:
+    """
+    Ends the run past MAX_STEPS, its exit handlers and the report run first. Not by raising:
+    an exception from step() can be caught by the main file -- a bare `except:` would catch
+    even a BaseException -- and a loop around it would then spin for ever.
+    """
+    REPORT["too_long"] = True
+    print("robotarium simulate: stopped after %d steps, past the form's maximum duration."
+          % MAX_STEPS, file=sys.stderr)
+    # What exiting would have run: a RunLogger's last save, the main file's own handlers, and
+    # this report (registered first, so run last).
+    try:
+        atexit._run_exitfuncs()
+    finally:
+        write_report()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(4)
 
 
 def install(fast: bool) -> bool:
@@ -55,6 +84,14 @@ def install(fast: bool) -> bool:
     def __init__(self, *args, **kwargs):
         if fast:
             kwargs["sim_in_real_time"] = False
+        # The testbed always drives the robots to their initial poses; a run that skips the
+        # drive is shorter than the one the testbed will do, and starts from somewhere else.
+        # Only touched when the main file passed it: rps before V2 has no such keyword.
+        if kwargs.get("skip_initialization"):
+            print("robotarium simulate: ignoring skip_initialization=True -- the testbed always "
+                  "drives the robots to their initial poses first.", file=sys.stderr)
+            REPORT["skipped_initialization"] = True
+            kwargs["skip_initialization"] = False
         REPORT["robots"].append(kwargs.get("number_of_robots", -1))
         _INSTANCES.append(self)
         original_init(self, *args, **kwargs)
@@ -64,6 +101,8 @@ def install(fast: bool) -> bool:
             REPORT["init_steps"] += 1
         else:
             REPORT["steps"] += 1
+        if MAX_STEPS and REPORT["init_steps"] + REPORT["steps"] > MAX_STEPS:
+            stop_too_long()
         return original_step(self, *args, **kwargs)
 
     cls.__init__ = __init__
@@ -95,12 +134,26 @@ def write_report() -> None:
         Path(destination).write_text(json.dumps(REPORT), encoding="utf-8")
 
 
+def _interrupted(number, frame):
+    raise KeyboardInterrupt
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         print("usage: python -m robotarium._simshim MAIN_FILE", file=sys.stderr)
         return 2
     main_file = Path(sys.argv[1]).resolve()
     atexit.register(write_report)
+
+    # Headless, the simulator's own plt.show() has nothing to show and matplotlib says so on
+    # every run; that warning is about how the run is watched, not about the experiment.
+    if os.environ.get("MPLBACKEND", "").lower() == "agg":
+        warnings.filterwarnings("ignore", message=".*non-interactive, and thus cannot be shown")
+
+    # Windows has no SIGINT to send to another process; simulate.py sends Ctrl-Break instead,
+    # and it means the same here: stop, and report on the way out.
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, _interrupted)
 
     if not install(fast=os.environ.get("ROBOTARIUM_SIM_FAST") == "1"):
         print("The Robotarium simulator (rps) is not importable: %s" % REPORT["exception"],
@@ -114,7 +167,12 @@ def main() -> int:
         runpy.run_path(str(main_file), run_name="__main__")
     except SystemExit as exit_:
         code = exit_.code
-        return code if isinstance(code, int) else (0 if code is None else 1)
+        if code is None or isinstance(code, int):
+            return code or 0
+        # sys.exit("message"): Python prints the message and exits 1, and so does this.
+        print(code, file=sys.stderr)
+        REPORT["exception"] = "SystemExit: %s" % (code,)
+        return 1
     except BaseException:  # noqa: BLE001 -- the report is the point; the traceback is printed
         REPORT["exception"] = traceback.format_exc(limit=-8)
         traceback.print_exc()

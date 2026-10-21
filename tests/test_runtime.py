@@ -148,3 +148,88 @@ def test_a_missing_backend_file_says_to_upload_it(tmp_path, monkeypatch, fresh_r
 def test_the_module_name_is_read_from_the_source(fresh_runtime):
     assert fresh_runtime.julia_module_name("# c\nmodule SheafBackend\nend") == "SheafBackend"
     assert fresh_runtime.julia_module_name("f(x) = x") is None
+
+
+def test_autosave_counts_records_not_step_numbers(tmp_path, fresh_runtime):
+    log = fresh_runtime.RunLogger(directory=tmp_path, autosave_every=10, save_at_exit=False)
+    saves = []
+    real_save = log.save
+    log.save = lambda: saves.append(1) or real_save()
+    for step in range(0, 200, 2):
+        log.record(step=step, x=step)
+    assert len(saves) == 10
+    run = fresh_runtime.load_run(log.path)
+    assert run.meta["records"] == 100 and run.steps["x"][-1] == 198
+
+
+def test_a_refused_record_keeps_nothing_of_it(tmp_path, fresh_runtime):
+    log = fresh_runtime.RunLogger(directory=tmp_path, save_at_exit=False)
+    log.record(a=np.zeros(2), b=np.zeros(3))
+    with pytest.raises(ValueError, match="'b'"):
+        log.record(a=np.ones(2), b=np.zeros(4))
+    log.record(a=np.ones(2), b=np.ones(3))
+    run = fresh_runtime.load_run(log.save())
+    assert run.data["a"].shape == (2, 2) and run.data["b"].shape == (2, 3)
+    assert list(run.steps["a"]) == list(run.steps["b"]) == [0, 1]
+
+
+def test_a_note_belongs_to_the_last_recorded_step(tmp_path, fresh_runtime):
+    log = fresh_runtime.RunLogger(directory=tmp_path, save_at_exit=False, echo=False)
+    log.note("before anything")
+    log.record(step=10, x=1)
+    log.note("at ten")
+    assert [note["step"] for note in log.meta["notes"]] == [0, 10]
+
+
+def test_a_value_that_needs_pickling_is_refused(tmp_path, fresh_runtime):
+    log = fresh_runtime.RunLogger(directory=tmp_path, save_at_exit=False)
+    with pytest.raises(ValueError, match="'target'"):
+        log.record(target=None, x=1.0)
+    log.record(label="phase one", x=1.0)
+    assert fresh_runtime.load_run(log.save()).data["label"][0] == "phase one"
+
+
+def test_a_failed_write_leaves_no_partial_file(tmp_path, fresh_runtime, monkeypatch):
+    log = fresh_runtime.RunLogger(directory=tmp_path, save_at_exit=False)
+    log.record(x=1)
+
+    def full(*arguments, **keywords):
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(fresh_runtime.np, "savez_compressed", full)
+    with pytest.raises(OSError):
+        log.save()
+    assert list(tmp_path.iterdir()) == []
+
+
+
+@pytest.mark.parametrize("value", [
+    np.zeros(2, dtype=[("a", float), ("b", object)]),
+    np.array([None, 1], dtype=object),
+])
+def test_anything_holding_objects_is_refused(tmp_path, fresh_runtime, value):
+    log = fresh_runtime.RunLogger(directory=tmp_path, save_at_exit=False)
+    with pytest.raises(ValueError, match="not numbers or text"):
+        log.record(x=value)
+
+
+@pytest.mark.parametrize("name", ["file", "allow_pickle", "__meta__", "__steps__x"])
+def test_reserved_names_are_refused(tmp_path, fresh_runtime, name):
+    log = fresh_runtime.RunLogger(directory=tmp_path, save_at_exit=False)
+    with pytest.raises(ValueError, match="reserves"):
+        log.record(**{name: 1.0})
+
+
+def test_a_series_must_keep_a_type_it_can_be_stacked_in(tmp_path, fresh_runtime):
+    log = fresh_runtime.RunLogger(directory=tmp_path, save_at_exit=False)
+    log.record(when=np.datetime64("2026-10-21T15:00"))
+    with pytest.raises(ValueError, match="cannot be kept as one array"):
+        log.record(when=1.5)
+    log.record(when=np.datetime64("2026-10-21T15:00:01"))
+    assert fresh_runtime.load_run(log.save()).data["when"].shape == (2,)
+
+
+def test_two_loggers_of_one_name_write_two_files(tmp_path, fresh_runtime):
+    first = fresh_runtime.RunLogger("same", directory=tmp_path, save_at_exit=False)
+    second = fresh_runtime.RunLogger("same", directory=tmp_path, save_at_exit=False)
+    assert first.path != second.path

@@ -104,3 +104,40 @@ def test_simulate_then_inspect_the_run_log(project_dir, capsys):
     assert cli.main(["inspect", str(run)]) == 0
     out = capsys.readouterr().out
     assert "poses                150x3x4" in out and "finished 150 steps" in out
+
+
+
+def test_a_file_glob_on_the_command_line_is_read_from_here(tmp_path, fake_site, logged_in,
+                                                         monkeypatch):
+    here = tmp_path / "work[1]"
+    write(here / "go.py", "import rps.robotarium as robotarium\n"
+                          "r = robotarium.Robotarium(number_of_robots=2)\nr.debug()\n")
+    write(here / "data" / "a.npy", "")
+    write(here / "data" / "b.npy", "")
+    monkeypatch.chdir(here)
+    code = cli.main(["submit", "--title", "G", "--description", "D", "--duration", "60",
+                     "--robots", "2", "--main", "go.py", "--file", "data/*.npy", "--yes"])
+    assert code == 0
+    uploads = [each["filename"] for each in fake_site if each["path"] == "/api/files/upload"]
+    assert uploads == ["go.py", "a.npy", "b.npy"]
+
+
+
+def test_flags_alone_default_to_the_maximum_duration(tmp_path, fake_site, logged_in):
+    write(tmp_path / "go.py", "import rps.robotarium as robotarium\n"
+                              "r = robotarium.Robotarium(number_of_robots=2)\nr.debug()\n")
+    code = cli.main(["submit", "--title", "T", "--description", "D", "--robots", "2",
+                     "--main", str(tmp_path / "go.py"), "--yes"])
+    assert code == 0
+    create = next(each["json"] for each in fake_site if each["path"].endswith("create"))
+    assert create["estimatedDuration"] == "600"
+
+
+
+def test_login_refuses_a_password_that_is_not_text_without_showing_it(tmp_path, capsys,
+                                                                      monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda prompt: "someone@example.edu")
+    monkeypatch.setattr("getpass.getpass", lambda prompt: "zqj\udcffxvk")
+    assert cli.main(["login", "--store", "file", "--verify"]) == 1
+    err = capsys.readouterr().err
+    assert "not valid text" in err and "zqj" not in err and "xvk" not in err

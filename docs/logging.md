@@ -98,8 +98,16 @@ Every `robotarium submit` that reaches the network appends one JSON line to
  "simulation": {"steps": 1200, "init_steps": 310, "errors": {}, "robots": [4]}, ...}
 ```
 
-A failed attempt has `"outcome": "failed"` and the site's reason. If files were uploaded before
-the failure, the count is recorded too, since those files are left attached to no experiment.
+A failed attempt has `"outcome": "failed"`, or `"interrupted"` for Ctrl-C. It also records the
+`stage` it failed at (`login`, `settings`, `upload`, `create` or `mark-main`), the reason, and a
+`consequence` saying what the failure left on the site:
+- **upload:** files uploaded and attached to no experiment.
+- **create:** the connection dropped after the request went out, so the experiment may exist
+  anyway. Check the dashboard before submitting again.
+- **mark-main:** the experiment was created but its main file isn't marked. Tick it on the site
+  instead of resubmitting.
+
+The same sentence ends the error `submit` prints.
 The zip in `snapshots/` holds exactly the files that were uploaded.
 
 ```bash

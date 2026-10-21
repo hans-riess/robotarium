@@ -16,6 +16,7 @@ docs/manifest.md is the reference for every key a robotarium.toml may hold.
 import datetime
 import glob
 import json
+import os
 import re
 import subprocess
 import tomllib
@@ -33,6 +34,10 @@ MANIFEST_NAME = "robotarium.toml"
 BUNDLE_MODULE = "robotarium_bundle.py"
 RUNTIME_MODULE = "robotarium_runtime.py"
 GENERATED_NAMES = (BUNDLE_MODULE, RUNTIME_MODULE)
+
+#: The durations given as words: "auto" declares the form's maximum, and "measured" takes the
+#: duration from a simulator run. "auto" is the default.
+DURATION_WORDS = ("auto", "measured")
 
 #: Placeholders a title may carry, filled in when the bundle is built.
 TITLE_FIELDS = ("date", "time", "timestamp", "git", "robots", "main")
@@ -68,7 +73,9 @@ class Experiment:
             filled in when the bundle is built; see render_title.
         description (str): "Experiment Description".
         duration: "Estimated Duration": seconds as an int, a string such as "90", "90s", "2m" or
-            "1m30s", or "auto" to take it from a simulator run (see simulate.py).
+            "1m30s"; "auto" for the form's maximum, 600 s (the testbed stops a run that outlasts
+            its declared duration, and declaring more costs nothing); or "measured" to take it
+            from a simulator run, with headroom (see simulate.py).
         robots (int): "Number of Robots", 1 to 18.
         main: The main file, a .py (or a MATLAB .m).
         files (list): The supporting files. Globs are expanded; the main file may be listed or
@@ -124,7 +131,7 @@ class Experiment:
         """
         paths = [self.main]
         for entry in self.files:
-            if glob.has_magic(str(entry)):
+            if self._is_pattern(entry):
                 paths.extend(self._expand(entry))
             else:
                 paths.append(self._resolve(entry))
@@ -137,10 +144,27 @@ class Experiment:
                 unique.append(path)
         return unique
 
+    def _is_pattern(self, entry) -> bool:
+        """
+        Whether a files entry is a glob. One that names an existing file is that file, even
+        with [ ] * or ? in its path -- `submit --file exp[1]/data.npy` must not go looking for
+        exp1/data.npy.
+        """
+        return glob.has_magic(str(entry)) and not self._resolve(entry).is_file()
+
     def _expand(self, entry) -> list:
-        pattern = str(self._resolve(entry))
-        if not glob.has_magic(pattern):
+        text = str(entry)
+        if not glob.has_magic(text):
             return []
+        # Only what the entry spells is a pattern: the project's own directory (exp[1]/), or
+        # the home directory a leading ~ stands for, must not be read as one.
+        if text.startswith("~"):
+            head, rest = re.match(r"(~[^/\\]*)[/\\]?(.*)", text, re.DOTALL).groups()
+            pattern = os.path.join(glob.escape(os.path.expanduser(head)), rest)
+        elif Path(text).is_absolute():
+            pattern = text
+        else:
+            pattern = os.path.join(glob.escape(str(self.root)), text)
         return sorted(Path(each) for each in glob.glob(pattern, recursive=True)
                       if Path(each).is_file())
 
@@ -196,10 +220,11 @@ class Experiment:
         if not str(self.description or "").strip():
             add(Finding(ERROR, "The experiment needs a description."))
 
-        if self.duration != "auto":
+        if self.duration not in DURATION_WORDS:
             if not isinstance(self.duration, int) or isinstance(self.duration, bool):
                 add(Finding(ERROR, "Estimated duration %r is not a number of seconds; give "
-                                   "e.g. 120, \"90s\", \"2m\" or \"auto\"." % (self.duration,)))
+                                   "e.g. 120, \"90s\", \"2m\", \"auto\" or \"measured\"."
+                                   % (self.duration,)))
             elif not 1 <= self.duration <= limits.MAX_DURATION_SECONDS:
                 add(Finding(ERROR, "Estimated duration %d s is outside the form's 1-%d s."
                                    % (self.duration, limits.MAX_DURATION_SECONDS)))
@@ -226,7 +251,7 @@ class Experiment:
                 " or ".join(limits.MAIN_FILE_EXTENSIONS), self.main.name)))
 
         for entry in self.files:
-            if glob.has_magic(str(entry)) and not self._expand(entry):
+            if self._is_pattern(entry) and not self._expand(entry):
                 add(Finding(WARNING, "%r matches no files." % str(entry)))
 
         by_name = {}
@@ -325,10 +350,12 @@ class Project:
 
 def parse_duration(value):
     """
-    A duration in whole seconds, rounded up, or "auto".
+    A duration in whole seconds, rounded up; or "auto" (the form's maximum) or "measured" (from a
+    simulator run), kept as words until the bundle is built.
 
         parse_duration(90) == parse_duration("90") == parse_duration("90s") == 90
-        parse_duration("2m") == 120;  parse_duration("1m30s") == 90;  parse_duration("1.5 min") == 90
+        parse_duration("2m") == 120
+        parse_duration("1m30s") == parse_duration("1.5 min") == 90
 
     Args:
         value: An int or float of seconds, or a string as above.
@@ -338,8 +365,8 @@ def parse_duration(value):
     if isinstance(value, (int, float)):
         return int(-(-value // 1))
     text = str(value).strip().lower()
-    if text == "auto":
-        return "auto"
+    if text in DURATION_WORDS:
+        return text
     match = re.fullmatch(r"(?:(\d+(?:\.\d+)?)\s*m(?:in(?:utes?)?)?)?\s*"
                          r"(?:(\d+(?:\.\d+)?)\s*(?:s(?:ec(?:onds?)?)?)?)?", text)
     if not text or not match or not any(match.groups()):
@@ -429,7 +456,7 @@ def load_project(path=".") -> Project:
 
     root = manifest.parent
     table = data.get("experiment") or {}
-    missing = [key for key in ("title", "duration", "robots", "main") if key not in table]
+    missing = [key for key in ("title", "robots", "main") if key not in table]
     if "description" not in table and "description_file" not in table:
         missing.append("description (or description_file)")
     if missing:
@@ -452,7 +479,7 @@ def load_project(path=".") -> Project:
     experiment = Experiment(
         title=table["title"],
         description=str(description).strip(),
-        duration=table["duration"],
+        duration=table.get("duration", "auto"),
         robots=table["robots"],
         main=table["main"],
         files=list(table.get("files") or []),

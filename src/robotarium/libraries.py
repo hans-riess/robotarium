@@ -125,6 +125,21 @@ def load(path=None, simulator_path=None) -> Libraries:
 SHIPPED_FROM = "robotarium_python_simulator ba1d74e, 2026-06-29"
 
 
+#: The testbed's Python, as far as can be told from outside: see data/stdlib_py310.txt.
+TESTBED_PYTHON = "3.10"
+
+
 def stdlib_modules() -> set:
-    """The standard library's top-level modules, as this interpreter knows them."""
-    return set(sys.stdlib_module_names)
+    """
+    The standard library's top-level modules on the TESTBED's Python, not this one: tomllib
+    (3.11) is missing there, while imp and distutils (removed in 3.12) are present.
+    """
+    text = resources.files("robotarium").joinpath("data/stdlib_py310.txt").read_text(
+        encoding="utf-8")
+    return {line.strip() for line in text.splitlines()
+            if line.strip() and not line.startswith("#")}
+
+
+def newer_stdlib_modules() -> set:
+    """Standard-library modules this Python has and the testbed's does not, such as tomllib."""
+    return set(sys.stdlib_module_names) - stdlib_modules()

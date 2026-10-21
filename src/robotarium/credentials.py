@@ -21,6 +21,7 @@ two stores `robotarium login` is explicitly asked to use. docs/credentials.md is
 
 import getpass
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -73,28 +74,100 @@ def user_credentials_file() -> Path:
     return base / "robotarium" / "credentials"
 
 
-def read_env_file(path: Path) -> dict:
+def read_env_file(path: Path, inline_comments: bool = True) -> dict:
     """
-    KEY=VALUE pairs from a dotenv file: blank lines and # comments skipped, an `export ` prefix
-    and matching quotes around a value stripped. Nothing is interpolated.
+    KEY=VALUE pairs from a dotenv file, read as python-dotenv reads them: blank lines and #
+    comments skipped, an `export ` prefix allowed. A value in double quotes keeps everything
+    inside them, with the escapes \\\\ \\" \\' \\n \\t \\r \\a \\b \\f \\v decoded and any other
+    backslash kept as it is; in single quotes, everything literally. An unquoted value has its
+    surrounding whitespace stripped and, with inline_comments, ends at a ` #` comment. Nothing
+    is interpolated.
 
     Args:
         path (Path): The file.
+        inline_comments (bool): Treat ` #` in an unquoted value as the start of a comment. The
+            per-user file is read without, since `robotarium login` once wrote values unquoted.
     """
     values = {}
-    for line in Path(path).read_text(encoding="utf-8").splitlines():
-        line = line.strip()
+    # Lines end at \n alone (and a \r before it): a password may hold any other character
+    # str.splitlines() would also break at.
+    for line in _read_text(path).split("\n"):
+        line = line.removesuffix("\r").strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, value = line.partition("=")
         key = key.strip()
         if key.startswith("export "):
             key = key[len("export "):].strip()
-        value = value.strip()
+        values[key] = _env_value(value.lstrip(), inline_comments)
+    return values
+
+
+def _read_text(path: Path) -> str:
+    """A credentials file's text. One that is not UTF-8 is refused by name: the decoding
+    error would quote the offending byte, which may be part of the password."""
+    try:
+        return Path(path).read_bytes().decode("utf-8")
+    except UnicodeDecodeError:
+        raise CredentialsError("%s is not UTF-8 text; save it as UTF-8." % path) from None
+
+
+#: The first line of a per-user file written by this version of `robotarium login`. A file
+#: without it was written by the first version, which did not quote values: it is read with that
+#: version's rules, so a password stored then still reads back as it was.
+USER_FILE_HEADER = "# Written by `robotarium login` (format 2). Remove with `robotarium logout`."
+
+
+def read_user_file(path: Path) -> dict:
+    """The per-user credentials file, in whichever format wrote it."""
+    text = _read_text(path)
+    if text.split("\n", 1)[0].strip() == USER_FILE_HEADER:
+        return read_env_file(path, inline_comments=False)
+    values = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        if key.startswith("export "):
+            key = key[len("export "):].strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
             value = value[1:-1]
         values[key] = value
     return values
+
+
+#: The escapes python-dotenv decodes inside double quotes; any other backslash is kept.
+_ESCAPES = {"\\": "\\", '"': '"', "'": "'", "n": "\n", "t": "\t", "r": "\r", "a": "\a",
+            "b": "\b", "f": "\f", "v": "\v"}
+
+
+def _env_value(text: str, inline_comments: bool = True) -> str:
+    """One value, as read_env_file describes."""
+    if text[:1] == '"':
+        value, escaped = [], False
+        for character in text[1:]:
+            if escaped:
+                value.append(_ESCAPES.get(character, "\\" + character))
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                return "".join(value)
+            else:
+                value.append(character)
+    elif text[:1] == "'" and "'" in text[1:]:
+        return text[1:text.index("'", 1)]
+    if inline_comments:
+        text = re.split(r"\s#", text, maxsplit=1)[0]
+    return text.strip()
+
+
+def _quote(value: str) -> str:
+    """A value written so that _env_value reads it back exactly."""
+    return '"%s"' % (value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+                     .replace("\r", "\\r"))
 
 
 def env_file_candidates(project_root: Path = None, env_file: Path = None) -> list:
@@ -157,7 +230,7 @@ def resolve(project_root: Path = None, env_file: Path = None, use_keyring: bool 
     user_file = user_credentials_file()
     if (username is None or password is None) and user_file.is_file():
         before = (username, password)
-        take(read_env_file(user_file), str(user_file))
+        take(read_user_file(user_file), str(user_file))
         if (username, password) != before:
             warnings.extend(file_warnings(user_file, in_project=False))
 
@@ -182,8 +255,24 @@ def resolve(project_root: Path = None, env_file: Path = None, use_keyring: bool 
             "No %s found. Set %s in the environment or in a .env file beside robotarium.toml, "
             "or run `robotarium login` to keep them in the system keyring. docs/credentials.md "
             "has the details." % (" or ".join(missing), " and ".join(missing)))
+    check_text(**{"%s from %s" % (USERNAME_VARIABLE, username_source): username,
+                  "%s from %s" % (PASSWORD_VARIABLE, password_source): password})
 
     return Credentials(username, password, username_source, password_source, tuple(warnings))
+
+
+def check_text(**values) -> None:
+    """
+    Refuses a value that is not valid text -- bytes that are not UTF-8, from a mis-encoded
+    environment, file or terminal -- by name only: the value, and the character, stay out of
+    the message.
+    """
+    for name, value in values.items():
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError:
+            raise CredentialsError("%s is not valid text (it holds bytes that are not UTF-8); "
+                                   "set it again." % name) from None
 
 
 def file_warnings(path: Path, in_project: bool) -> list:
@@ -251,7 +340,8 @@ def store(username: str, password: str, where: str = "keyring") -> str:
         where (str): "keyring" or "file".
     """
     path = user_credentials_file()
-    values = read_env_file(path) if path.is_file() else {}
+    check_text(username=username, password=password)
+    values = read_user_file(path) if path.is_file() else {}
     values[USERNAME_VARIABLE] = username
 
     if where == "keyring":
@@ -276,7 +366,10 @@ def forget() -> list:
     """Removes what store() kept, and says what was removed."""
     removed = []
     path = user_credentials_file()
-    values = read_env_file(path) if path.is_file() else {}
+    try:
+        values = read_user_file(path) if path.is_file() else {}
+    except CredentialsError:
+        values = {}  # unreadable; it is removed all the same
     username = values.get(USERNAME_VARIABLE) or os.environ.get(USERNAME_VARIABLE)
     if username and keyring_password(username):
         import keyring
@@ -291,8 +384,8 @@ def forget() -> list:
 def _write_private(path: Path, values: dict) -> None:
     """Writes a dotenv file that only this user can read, creating it that way from the start."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    text = "# Written by `robotarium login`. Remove with `robotarium logout`.\n" + "".join(
-        "%s=%s\n" % (key, value) for key, value in values.items())
+    text = USER_FILE_HEADER + "\n" + "".join(
+        "%s=%s\n" % (key, _quote(value)) for key, value in values.items())
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
         handle.write(text)

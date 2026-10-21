@@ -19,6 +19,7 @@ This package generalises the submission tooling built for
 rather than at the end of the testbed's queue.
 
 - [Install](#install)
+- [Try it: a two-robot example](#try-it-a-two-robot-example)
 - [Credentials](#credentials)
 - [Describing an experiment](#describing-an-experiment)
 - [Commands](#commands)
@@ -31,18 +32,70 @@ rather than at the end of the testbed's queue.
 
 ## Install
 
-Python 3.11 or newer. Submitting needs only the standard library, so the extras are optional:
+Linux or macOS, both tested in CI; Windows is not supported yet
+([#2](https://github.com/hans-riess/robotarium/issues/2)). Python 3.11 or newer, in a virtual
+environment. Recent Linux distributions (Ubuntu 23.04+,
+Debian 12+) refuse `pip install` into the system Python with `externally-managed-environment`,
+and a venv is the right fix:
 
 ```bash
 git clone https://github.com/hans-riess/robotarium
-pip install -e "robotarium[sim]"            # + the Robotarium simulator, for `simulate`
-pip install -e "robotarium[sim,julia]"      # + juliacall, for a backend.jl
-pip install -e "robotarium[sim,keyring]"    # + keyring, for `robotarium login`
+cd robotarium
+python3 -m venv .venv            # on Ubuntu/Debian, if this fails: sudo apt install python3-venv
+source .venv/bin/activate        # each new terminal; Windows: .venv\Scripts\activate
+pip install -e ".[sim,julia,keyring]"
 ```
+
+Submitting needs only the standard library, so each extra is optional: `sim` installs the
+Robotarium simulator (`simulate`), `julia` installs juliacall (a `backend.jl`; Julia itself is
+downloaded on first use), and `keyring` lets `robotarium login` keep the password in the
+system keyring. `pip install -e .` alone is enough to bundle, check and submit.
 
 `[sim]` installs `rps` from the
 [robotarium_python_simulator](https://github.com/robotarium/robotarium_python_simulator)
 repository. To use a clone of it instead, see [docs/simulator.md](docs/simulator.md).
+
+## Try it: a two-robot example
+
+The package ships a small example for trying the CLI end to end. Two robots start 1.2 m apart,
+facing each other, and swap places; a barrier certificate keeps them apart as they pass, and
+the run ends when both have arrived (about 30 s on the testbed).
+
+```bash
+robotarium init try_robotarium --example two_robots
+cd try_robotarium
+
+robotarium check               # every offline check: form fields, files, imports
+robotarium simulate --show     # watch it in the Robotarium simulator (needs [sim])
+robotarium submit --dry-run    # exactly what would be sent; nothing is
+robotarium login --verify      # once: keep your login (see Credentials below)
+robotarium submit              # check, show, confirm, send
+robotarium history             # what was sent, and how it went
+```
+
+`init --example` copies the example out of the package (its source is
+[`src/robotarium/examples/two_robots/`](src/robotarium/examples/two_robots/)) into a folder of
+your own, which is where the rest of the commands run and where `.robotarium/` collects bundles,
+run logs and the submission ledger.
+
+`submit` runs the simulator first (the example sets `simulate = true`), declares the form's
+maximum duration of 600 s (`duration = "auto"`, the default; the run still ends when both robots
+arrive), and prints the full plan before asking for a yes. The example's `robotarium.toml`
+sets `draft = true`, so the experiment is **saved on the Robotarium as a draft, not queued**:
+check it on the [dashboard](https://www.robotarium.gatech.edu/dashboard) (title, two robots,
+`main.py` ticked as main), then submit it there or delete it. Use `robotarium submit --queue`
+when you do want it to run on the physical robots.
+
+The same walkthrough runs in this repository's tests against a local stand-in for the site
+(`tests/test_examples.py`). Against the real site it runs only when asked for, since it leaves a
+draft on your account:
+
+```bash
+ROBOTARIUM_LIVE_TEST=1 pytest -m live        # with your login available, as below
+```
+
+or from GitHub: **Actions → Live test → Run workflow**, once the repository has the secrets
+`ROBOTARIUM_USERNAME` and `ROBOTARIUM_PASSWORD`.
 
 ## Credentials
 
@@ -94,7 +147,7 @@ title = "Circle formation ({timestamp})"     # also {date} {time} {git} {robots}
 description = """
 Four GRITSBots drive to evenly spaced points on a circle.
 """
-duration = "auto"        # seconds, "90s", "2m", or "auto": measured in the simulator
+duration = "auto"        # the form's maximum, 600 s (the default); or "90s", "2m"; or "measured"
 robots = 4               # 1-18
 main = "main.py"         # the Main File
 files = ["helpers.py", "backend.jl", "data/*.npy"]   # supporting files; globs work
@@ -127,6 +180,7 @@ testbed as `Path(__file__).parent / "name.npy"`.
 
 | Command | Does |
 |---|---|
+| `robotarium init DIR --example two_robots` | Write the ready-made example above, to try the CLI on. |
 | `robotarium init DIR [--julia] [--robots N]` | Write a new experiment (manifest, main file, `.gitignore`, `.env.example`, and with `--julia` a `backend.jl`) that simulates and submits as it stands. |
 | `robotarium check` | Every offline check. Nothing is sent. Exits non-zero on an error (on a warning too with `--strict`). |
 | `robotarium bundle` | Build `.robotarium/bundle/` and show the form as it would be filled. |
@@ -152,14 +206,16 @@ Before anything is sent, and as far as possible before anything is run:
 - **The files:** they exist; no directories; only extensions the form takes (no `.json`, `.yaml`,
   `.txt`, `.zip`); no two with the same base name.
 - **Inside the Python:**
-  - imports the testbed lacks, checked against the simulator's `libraries.txt`;
+  - imports the testbed lacks, checked against the simulator's `libraries.txt` and against
+    Python 3.10's standard library, which the testbed appears to run (so `tomllib` is flagged);
   - local modules imported but not uploaded, and package directories, which can't travel;
   - relative imports, which fail in a flat bundle;
   - `Robotarium(number_of_robots=...)` disagreeing with the form;
   - no `r.debug()` / `r.call_at_scripts_end()` at the end;
+  - `skip_initialization=True`, a drive the testbed never skips;
   - numpy spellings newer than the testbed's.
 - **Inside the Julia:** packages loaded but not declared; `include`d files not uploaded.
-- **In the simulator** (`simulate`, `submit --simulate`, or `duration = "auto"`): collisions and
+- **In the simulator** (`simulate`, `submit --simulate`, or `duration = "measured"`): collisions and
   leaving the arena (errors: the testbed rejects them), saturated wheel commands, the robot
   count actually used, whether the run fits its declared duration.
 - **Against the live site**, after logging in and before uploading: its current limits.
@@ -215,8 +271,9 @@ backend locally exactly as the testbed will. `robotarium init --julia` is a work
   `.npz` (bundle title, commit, file hashes, notes), autosaving so that a run stopped at its
   declared duration still leaves data. `robotarium inspect` reads it.
 - **Submissions:** `.robotarium/submissions.jsonl` records every attempt, successful or not,
-  with the experiment id, form values and file hashes. A zip snapshot of exactly what was
-  uploaded goes to `.robotarium/snapshots/`. It holds no credentials and is safe to commit.
+  with the experiment id, form values and file hashes. A failed attempt also records the stage
+  it failed at and what it left on the site. A zip snapshot of exactly what was uploaded goes to
+  `.robotarium/snapshots/`. It holds no credentials and is safe to commit.
 - **The tool:** `-v` and `--log-file` show each step and each API call (never a body or a
   secret).
 

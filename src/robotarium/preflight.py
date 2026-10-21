@@ -22,7 +22,8 @@ from pathlib import Path
 
 from .experiment import BUNDLE_MODULE, GENERATED_NAMES, RUNTIME_MODULE
 from .findings import ERROR, INFO, WARNING, Finding
-from .libraries import stdlib_modules
+from .libraries import (ALWAYS_AVAILABLE, TESTBED_PYTHON, newer_stdlib_modules,
+                        stdlib_modules)
 
 #: Spellings that work on the machine a bundle is built on and fail on the one that runs it.
 #: This list is what has cost a round trip on robosheaf and its sibling project, not a model of
@@ -100,7 +101,8 @@ def imports(tree: ast.AST) -> list:
     """
     The imports in a module as (top-level name, line, level, optional) tuples. level is the
     relative-import depth (0 for absolute). optional is True for an import guarded by a try
-    that catches ImportError, or under `if TYPE_CHECKING:` -- it may fail without failing the run.
+    that catches ImportError, under `if TYPE_CHECKING:`, or under a sys.version_info test -- it
+    may fail without failing the run.
     """
     found = []
 
@@ -115,6 +117,16 @@ def imports(tree: ast.AST) -> list:
         if isinstance(node, ast.If) and _is_type_checking(node.test):
             for child in node.orelse:
                 visit(child, optional)
+            return
+        if isinstance(node, ast.If) and _is_version_check(node.test):
+            # `if sys.version_info >= (3, 11): import tomllib / else: import tomli`: the branch
+            # the testbed's Python takes is checked; the other is optional. A test that cannot
+            # be worked out leaves both optional.
+            on_testbed = _version_test_on_testbed(node.test)
+            for child in node.body:
+                visit(child, optional or on_testbed is not True)
+            for child in node.orelse:
+                visit(child, optional or on_testbed is not False)
             return
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -138,6 +150,55 @@ def _catches_import_error(handler: ast.ExceptHandler) -> bool:
                for each in types)
 
 
+def _is_version_check(test: ast.AST) -> bool:
+    return any(isinstance(node, ast.Attribute) and node.attr == "version_info"
+               for node in ast.walk(test))
+
+
+#: The testbed's Python as sys.version_info would compare; see libraries.TESTBED_PYTHON.
+_TESTBED_VERSION = (3, 10, 0)
+
+_COMPARE = {ast.Lt: lambda a, b: a < b, ast.LtE: lambda a, b: a <= b,
+            ast.Gt: lambda a, b: a > b, ast.GtE: lambda a, b: a >= b,
+            ast.Eq: lambda a, b: a == b, ast.NotEq: lambda a, b: a != b}
+
+
+def _version_test_on_testbed(test: ast.AST):
+    """
+    `sys.version_info <op> (3, 11)` (or `sys.version_info[:2]`, either side) worked out for the
+    testbed's Python: True or False, or None for any test this cannot evaluate.
+    """
+    if not (isinstance(test, ast.Compare) and len(test.ops) == 1
+            and type(test.ops[0]) in _COMPARE):
+        return None
+    left, right = test.left, test.comparators[0]
+
+    def version(node):
+        if isinstance(node, ast.Subscript):
+            if not (isinstance(node.slice, ast.Slice) and node.slice.lower is None
+                    and node.slice.step is None and isinstance(node.slice.upper, ast.Constant)):
+                return None
+            whole = version(node.value)
+            return None if whole is None else whole[:node.slice.upper.value]
+        if isinstance(node, ast.Attribute) and node.attr == "version_info":
+            return _TESTBED_VERSION
+        return None
+
+    def literal(node):
+        try:
+            value = ast.literal_eval(node)
+        except ValueError:
+            return None
+        return value if isinstance(value, tuple) and all(isinstance(each, int)
+                                                         for each in value) else None
+
+    if version(left) is not None and literal(right) is not None:
+        return _COMPARE[type(test.ops[0])](version(left), literal(right))
+    if literal(left) is not None and version(right) is not None:
+        return _COMPARE[type(test.ops[0])](literal(left), version(right))
+    return None
+
+
 def _is_type_checking(test: ast.AST) -> bool:
     return (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or \
         (isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING")
@@ -146,6 +207,7 @@ def _is_type_checking(test: ast.AST) -> bool:
 def _check_imports(path: Path, tree: ast.AST, names: set, experiment, libraries) -> list:
     findings = []
     stdlib = stdlib_modules()
+    newer = newer_stdlib_modules()
     allowed = set(experiment.allow_imports or ())
     local_roots = {experiment.root, Path(experiment.main).parent}
 
@@ -156,7 +218,16 @@ def _check_imports(path: Path, tree: ast.AST, names: set, experiment, libraries)
                                            "Import the module by name: the bundle is flat."
                                            % ("." * level, module), file=path.name, line=line))
             continue
-        if not module or module in stdlib or module in allowed or "%s.py" % module in names:
+        # The Robotarium's own API is there whatever is on disk here: a project inside a
+        # simulator clone has an rps/ beside it, and must not be told rps cannot travel.
+        if not module or module in stdlib or module in allowed or module in ALWAYS_AVAILABLE \
+                or "%s.py" % module in names:
+            continue
+        if module in newer and not optional:
+            findings.append(Finding(WARNING, "%s is not in the standard library of Python %s, "
+                                             "which the testbed appears to run (its "
+                                             "libraries.txt ships backports such as tomli)."
+                                    % (module, TESTBED_PYTHON), file=path.name, line=line))
             continue
         if module == "robotarium":
             findings.append(Finding(ERROR, "The robotarium package exists only on this machine. "
@@ -229,6 +300,14 @@ def _check_main(main: Path, trees: dict, experiment) -> list:
         if not (isinstance(node, ast.Call) and _call_name(node.func) == "Robotarium"):
             continue
         for keyword in node.keywords:
+            if keyword.arg == "skip_initialization" and not (
+                    isinstance(keyword.value, ast.Constant) and keyword.value.value is False):
+                findings.append(Finding(WARNING, "skip_initialization: the testbed always drives "
+                                                 "the robots to their initial poses first, so "
+                                                 "a run without that drive is not the run it "
+                                                 "will do (robotarium simulate does the drive "
+                                                 "regardless).", file=main.name,
+                                        line=node.lineno))
             if keyword.arg != "number_of_robots":
                 continue
             value = keyword.value
@@ -269,23 +348,146 @@ def _module_int_constants(tree: ast.Module) -> dict:
 # Julia
 # ---------------------------------------------------------------------------
 
-_USING = re.compile(r"^\s*(?:using|import)\s+([^#\n]+)", re.MULTILINE)
-_INCLUDE = re.compile(r"\binclude\(\s*\"([^\"]+)\"\s*\)")
+_STATEMENT = re.compile(r"^\s*(?:@[\w.]+\s+)*(?:using|import)\s+(.*)$", re.DOTALL)
+_NAME = re.compile(r"[^\W\d][\w!]*")
+
+
+_CHAR = re.compile(r"'(?:\\.[^']{0,8}|[^'\\\n])'")
+
+
+def julia_code(source: str) -> str:
+    """
+    A Julia source with every comment and the inside of every string, command and character
+    literal blanked -- replaced by spaces, newlines kept, so each character stays where it was.
+    What is left is code alone: a `;` or `#` or the word `using` inside a string cannot be read
+    as a statement. Read as Julia's own lexer reads it: `#=` comments nest, triple-quoted strings
+    span lines, `$(...)` inside a string is code that may hold strings of its own, and a `'` is a
+    character literal unless it follows something it could transpose (`A'`).
+    """
+    masked = list(source)
+
+    def blank(start, stop):
+        for k in range(start, min(stop, len(source))):
+            if masked[k] != "\n":
+                masked[k] = " "
+
+    i, n = 0, len(source)
+    while i < n:
+        j = _skip_non_code(source, i)
+        if j == i:
+            i += 1
+            continue
+        quote = _quote_at(source, i)
+        if quote:
+            # Keep the delimiters, so include("x.jl") can still be found by position.
+            blank(i + len(quote), max(i + len(quote), j - len(quote)))
+        else:
+            blank(i, j)
+        i = j
+    return "".join(masked)
+
+
+def _quote_at(source: str, i: int):
+    for quote in ('"""', "```", '"', "`"):
+        if source.startswith(quote, i):
+            return quote
+    return None
+
+
+def _skip_non_code(source: str, i: int) -> int:
+    """
+    If a comment, string, command or character literal starts at i, the index just past it;
+    otherwise i.
+    """
+    n = len(source)
+    if source.startswith("#=", i):
+        depth, j = 1, i + 2
+        while j < n and depth:
+            if source.startswith("#=", j):
+                depth, j = depth + 1, j + 2
+            elif source.startswith("=#", j):
+                depth, j = depth - 1, j + 2
+            else:
+                j += 1
+        return j
+    if source[i] == "#":
+        j = source.find("\n", i)
+        return n if j < 0 else j
+    quote = _quote_at(source, i)
+    if quote:
+        # A prefixed string (raw"...", r"...") has no interpolation.
+        prefixed = i > 0 and (source[i - 1].isalnum() or source[i - 1] == "_")
+        j = i + len(quote)
+        while j < n and not source.startswith(quote, j):
+            if source[j] == "\\":
+                j += 2
+            elif not prefixed and source.startswith("$(", j):
+                j = _skip_parenthesised(source, j + 2)
+            else:
+                j += 1
+        return min(n, j + len(quote))
+    if source[i] == "'" and not (i > 0 and (source[i - 1].isalnum()
+                                            or source[i - 1] in ")]}'_.!")):
+        match = _CHAR.match(source, i)
+        if match:
+            return match.end()
+    return i
+
+
+def _skip_parenthesised(source: str, j: int) -> int:
+    """The index just past the `)` closing a `$(` whose contents start at j."""
+    depth, n = 1, len(source)
+    while j < n:
+        after = _skip_non_code(source, j)
+        if after != j:
+            j = after
+            continue
+        if source[j] == "(":
+            depth += 1
+        elif source[j] == ")":
+            depth -= 1
+            if depth == 0:
+                return j + 1
+        j += 1
+    return n
+
+
+def julia_includes(source: str) -> list:
+    """The paths a Julia source include()s, from code only: not from comments or strings."""
+    code = julia_code(source)
+    found = []
+    for match in re.finditer(r"\binclude\s*\(\s*\"", code):
+        close = code.find('"', match.end())
+        if close > match.end():
+            found.append(source[match.end():close])
+    return found
 
 
 def julia_packages_used(source: str) -> list:
     """
     The packages a Julia source loads with `using` or `import`, in order, without repeats.
-    Relative imports (`using .Inner`) are the file's own modules and are left out.
+
+    Handles several statements on a line (`using A; using B`), a list continued over lines
+    (`using A,` / `B`, blank or comment lines between), `using A: f, g`, `import A as B`,
+    `import A.Sub`, and a macro in front (`@everywhere using A`). Strings and comments are
+    ignored (see julia_code). Relative imports (`using .Inner`) are the file's own modules and
+    are left out.
     """
-    source = re.sub(r"#=.*?=#", "", source, flags=re.DOTALL)
+    code = re.sub(r",\s*\n", ", ", julia_code(source))
     used = []
-    for match in _USING.finditer(source):
-        clause = match.group(1).split(":")[0]
-        for item in clause.split(","):
-            name = item.strip().split(" ")[0].split(".")[0]
-            if name and not item.strip().startswith(".") and name not in used:
-                used.append(name)
+    for line in code.splitlines():
+        for statement in line.split(";"):
+            match = _STATEMENT.match(statement)
+            if not match:
+                continue
+            clause = match.group(1).split(":")[0]
+            for item in clause.split(","):
+                item = item.strip()
+                if item.startswith("."):
+                    continue
+                name = _NAME.match(item)
+                if name and name.group(0) not in used:
+                    used.append(name.group(0))
     return used
 
 
@@ -319,7 +521,15 @@ def _check_julia(julia_files: list, names: set, trees: dict, experiment) -> list
                 "%s loads %s, which nothing installs on the testbed. Declare it under [julia] "
                 "packages in robotarium.toml (`robotarium julia lookup %s` prints the entry)."
                 % (path.name, package, package), file=path.name))
-        for included in _INCLUDE.findall(source):
+        for included in julia_includes(source):
+            # "./x.jl" and "$(@__DIR__)/x.jl" both name the file beside this one; any other
+            # interpolation cannot be resolved here, so it is left to the run.
+            included = included.replace("\\\\", "\\")  # the string's own \\ is one backslash
+            included = re.sub(r"^(?:\$\(@__DIR__\)|\$@__DIR__)[/\\]", "", included)
+            while included.startswith(("./", ".\\")):
+                included = included[2:]
+            if "$" in included:
+                continue
             if Path(included).name not in names:
                 findings.append(Finding(ERROR, "include(%r), but %s is not uploaded."
                                                % (included, Path(included).name),

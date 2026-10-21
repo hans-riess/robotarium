@@ -125,3 +125,73 @@ def test_login_to_the_keyring_keeps_the_password_out_of_the_file(monkeypatch):
 
 def test_an_email_is_masked():
     assert credentials.mask("hans@gmail.com") == "h***@g***.com"
+
+
+@pytest.mark.parametrize("password", ['"quoted"', " spaced ", "hash # inside", "back\\slash",
+                                      "it's", "#start", "new\nline"])
+def test_any_password_survives_the_credentials_file(password):
+    credentials.store(USERNAME, password, where="file")
+    assert resolve(interactive=False).password == password
+
+
+def test_dotenv_values_read_as_dotenv_does(tmp_path):
+    env = write(tmp_path / "x.env", "A=x  # note\nB='single # kept'\nC=\"dq\" # c\nD=a#b\n")
+    assert credentials.read_env_file(env) == {"A": "x", "B": "single # kept", "C": "dq",
+                                              "D": "a#b"}
+
+
+
+def test_dotenv_escapes_match_python_dotenv(tmp_path):
+    env = write(tmp_path / "x.env", 'A="abc\\def"\nB="C:\\Users\\me"\nC="a\\tb"\nD="q\\"q"\n')
+    assert credentials.read_env_file(env) == {"A": "abc\\def", "B": "C:\\Users\\me",
+                                              "C": "a\tb", "D": 'q"q'}
+
+
+@pytest.mark.parametrize("separator", ["\r", "\v", "\f", "\x1c", "\x85", "\u2028"])
+def test_line_separators_inside_a_password_survive(separator):
+    password = "a%sb" % separator
+    credentials.store(USERNAME, password, where="file")
+    assert resolve(interactive=False).password == password
+
+
+def test_a_file_the_first_version_of_login_wrote_still_reads_back(tmp_path):
+    path = credentials.user_credentials_file()
+    write(path, "# Written by `robotarium login`.\nROBOTARIUM_USERNAME=%s\n"
+                "ROBOTARIUM_PASSWORD=pass # word\n" % USERNAME)
+    assert resolve(interactive=False).password == "pass # word"
+
+
+def test_a_password_that_is_not_text_is_refused_without_showing_it(monkeypatch):
+    monkeypatch.setenv("ROBOTARIUM_USERNAME", USERNAME)
+    monkeypatch.setenv("ROBOTARIUM_PASSWORD", "secret\udcff")
+    with pytest.raises(CredentialsError, match="not valid text") as error:
+        resolve(interactive=False)
+    assert "secret" not in str(error.value)
+
+
+
+def test_a_file_that_is_not_utf8_is_refused_by_name(tmp_path):
+    env = tmp_path / ".env"
+    env.write_bytes(b"ROBOTARIUM_USERNAME=someone@example.edu\nROBOTARIUM_PASSWORD=pa\xffss\n")
+    with pytest.raises(CredentialsError, match="not UTF-8 text") as error:
+        resolve(project_root=tmp_path, interactive=False)
+    assert "0xff" not in str(error.value) and "pa" not in str(error.value).split(".env")[-1]
+
+
+def test_storing_a_password_that_is_not_text_keeps_the_old_file():
+    credentials.store(USERNAME, PASSWORD, where="file")
+    path = credentials.user_credentials_file()
+    before = path.read_bytes()
+    with pytest.raises(CredentialsError, match="not valid text") as error:
+        credentials.store(USERNAME, "bad\udcffpass", where="file")
+    assert path.read_bytes() == before and "bad" not in str(error.value)
+
+
+def test_a_new_file_says_its_format_and_an_old_one_keeps_its_rules(tmp_path):
+    credentials.store(USERNAME, '"a"b', where="file")
+    path = credentials.user_credentials_file()
+    assert path.read_text().splitlines()[0] == credentials.USER_FILE_HEADER
+    assert resolve(interactive=False).password == '"a"b'
+    write(path, "# Written by `robotarium login`. Remove with `robotarium logout`.\n"
+                "ROBOTARIUM_USERNAME=%s\nROBOTARIUM_PASSWORD=\"a\"b\n" % USERNAME)
+    assert resolve(interactive=False).password == '"a"b'

@@ -18,7 +18,7 @@ agree with:
     ended           whether debug() / call_at_scripts_end() was called
 
 (init_steps + steps) x 0.033 s is the run's wall clock on the testbed, which is what "Estimated
-Duration" asks for; limits.suggested_duration adds headroom. A duration of "auto" in
+Duration" asks for; limits.suggested_duration adds headroom. A duration of "measured" in
 robotarium.toml is filled in from exactly that.
 
 The simulator is the `rps` package from robotarium_python_simulator. It is found the way Python
@@ -30,6 +30,7 @@ import collections
 import json
 import logging
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -38,6 +39,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import limits
+from .credentials import PASSWORD_VARIABLE, USERNAME_VARIABLE
 from .findings import ERROR, INFO, WARNING, Finding
 
 SIMULATOR_VARIABLE = "ROBOTARIUM_SIMULATOR"
@@ -66,6 +68,8 @@ class SimulationReport:
     ended: bool = False
     exception: str = None
     wall_seconds: float = None
+    skipped_initialization: bool = False
+    too_long: bool = False
     output: str = ""
 
     @property
@@ -92,6 +96,20 @@ class SimulationReport:
         findings = []
         add = findings.append
 
+        if self.timed_out:
+            add(Finding(ERROR, "The run was stopped at the timeout, after %s."
+                               % ("%d steps" % self.total_steps if self.rps
+                                  else "an unknown number of steps (it was stopped before it "
+                                       "could report)")))
+            if self.rps is None:
+                return findings
+        elif self.too_long:
+            add(Finding(ERROR, "The run was stopped after %d steps, about %.0f s on the testbed: "
+                               "longer than the form's %d s maximum, so it cannot be submitted "
+                               "as it is. (A drive to initial poses the robots cannot reach "
+                               "never ends either.)"
+                               % (self.total_steps, self.testbed_seconds,
+                                  limits.MAX_DURATION_SECONDS)))
         if self.rps is None:
             if self.returncode == 3:
                 add(Finding(ERROR, "The simulator (rps) is not importable. Install it (pip "
@@ -103,10 +121,7 @@ class SimulationReport:
                 add(Finding(ERROR, "The run ended before the simulator could report (exit %d): "
                                    "%s" % (self.returncode, last[0])))
             return findings
-        if self.timed_out:
-            add(Finding(ERROR, "The run was stopped at the timeout, after %d steps."
-                               % self.total_steps))
-        elif self.returncode != 0:
+        if self.returncode != 0 and not (self.timed_out or self.too_long):
             last = (self.exception or self.output).strip().splitlines()[-1:] or ["no output"]
             add(Finding(ERROR, "The main file failed in the simulator (exit %d): %s"
                                % (self.returncode, last[0])))
@@ -137,7 +152,11 @@ class SimulationReport:
             add(Finding(WARNING, "The run never called r.debug() (or r.call_at_scripts_end()), "
                                  "which the Robotarium requires at the end."))
 
-        if self.total_steps:
+        if self.skipped_initialization:
+            add(Finding(INFO, "skip_initialization=True was overridden: the robots were driven "
+                              "to their initial poses first, as on the testbed."))
+        # A run cut short says nothing about how long the whole one takes.
+        if self.total_steps and not (self.timed_out or self.too_long):
             add(Finding(INFO, "%d steps (%d driving to the initial poses): about %.0f s on the "
                               "testbed. Suggested estimated duration: %d s."
                               % (self.total_steps, self.init_steps, self.testbed_seconds,
@@ -146,7 +165,8 @@ class SimulationReport:
                     and self.testbed_seconds > experiment.duration:
                 add(Finding(ERROR, "The run takes about %.0f s on the testbed, and the form "
                                    "would declare %d s; the testbed stops a run that outlasts "
-                                   "its declared duration. Declare %d, or \"auto\"."
+                                   "its declared duration. Declare %d, or \"auto\" (the "
+                                   "form's maximum)."
                                    % (self.testbed_seconds, experiment.duration,
                                       self.suggested_duration)))
             if self.testbed_seconds > limits.MAX_DURATION_SECONDS:
@@ -188,7 +208,9 @@ def run(bundle, simulator=None, fast: bool = True, headless: bool = True, timeou
     """
     if bundle.main.suffix != ".py":
         raise ValueError("Only a Python main file can be simulated, not %s." % bundle.main.name)
-    environment = dict(os.environ)
+    # The experiment is the user's code, but it has no business with the Robotarium login.
+    environment = {key: value for key, value in os.environ.items()
+                   if key not in (USERNAME_VARIABLE, PASSWORD_VARIABLE)}
     checkout = simulator_path(simulator)
     if checkout:
         environment["PYTHONPATH"] = os.pathsep.join(
@@ -196,9 +218,17 @@ def run(bundle, simulator=None, fast: bool = True, headless: bool = True, timeou
     if headless:
         environment["MPLBACKEND"] = "Agg"
     environment["ROBOTARIUM_SIM_FAST"] = "1" if fast else "0"
+    # The reader decodes UTF-8, so the run writes it, whatever the console's own encoding
+    # (cp1252 on Windows).
+    environment["PYTHONIOENCODING"] = "utf-8"
     if log_dir:
         Path(log_dir).mkdir(parents=True, exist_ok=True)
         environment["ROBOTARIUM_LOG_DIR"] = str(Path(log_dir).resolve())
+
+    # The run stops itself past the form's maximum: no run that long can be submitted, and a
+    # drive to initial poses the robots cannot reach would otherwise never end.
+    environment["ROBOTARIUM_SIM_MAX_STEPS"] = str(
+        int(limits.MAX_DURATION_SECONDS / limits.STEP_SECONDS) + 1)
 
     with tempfile.TemporaryDirectory() as scratch:
         report_path = Path(scratch) / "report.json"
@@ -206,37 +236,127 @@ def run(bundle, simulator=None, fast: bool = True, headless: bool = True, timeou
         command = [python or sys.executable, "-m", "robotarium._simshim", str(bundle.main)]
         log.debug("running %s in %s", " ".join(command), bundle.directory)
 
-        tail = collections.deque(maxlen=60)
+        # Output a console cannot show is replaced, never fatal: a reader that died would leave
+        # the run blocked on a full pipe.
+        # On Windows the run gets its own process group, which is what lets a timeout send it
+        # Ctrl-Break (the shim takes that as Ctrl-C) rather than terminate it outright.
         process = subprocess.Popen(command, cwd=bundle.directory, env=environment,
-                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                                   bufsize=1)
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   encoding="utf-8", errors="replace", bufsize=1,
+                                   creationflags=getattr(subprocess,
+                                                         "CREATE_NEW_PROCESS_GROUP", 0)
+                                   if os.name == "nt" else 0)
+        tail = collections.deque(maxlen=60)
+        reader = threading.Thread(target=_relay, args=(process.stdout, tail, echo), daemon=True)
+        reader.start()
+
         stopped = threading.Event()
         timer = None
         if timeout:
             def stop():
+                if process.poll() is not None:
+                    return  # it finished in time, whatever is still being printed
                 stopped.set()
-                process.kill()
+                _interrupt(process)  # so the shim still writes its report
+                killer = threading.Timer(10.0, _kill, (process,))
+                killer.daemon = True
+                killer.start()
             timer = threading.Timer(float(timeout), stop)
             timer.start()
+        restore = _stop_with_this_process()
         try:
-            for line in process.stdout:
-                tail.append(line)
-                if echo:
-                    sys.stdout.write(line)
-                    sys.stdout.flush()
             returncode = process.wait()
         finally:
+            restore()
             if timer is not None:
                 timer.cancel()
             if process.poll() is None:
-                process.kill()
+                _kill(process)
+                process.wait()
+        # The rest of the output, however slow the console; but a process the main file
+        # started and left holding the pipe does not keep this waiting past the 30 s (5 s once
+        # the run has already been stopped for its timeout).
+        reader.join(timeout=5 if stopped.is_set() else 30)
 
         data = {}
         if report_path.is_file():
             data = json.loads(report_path.read_text(encoding="utf-8"))
 
     known = {key: data[key] for key in ("rps", "robots", "init_steps", "steps", "errors",
-                                        "ended", "exception", "wall_seconds") if key in data}
+                                        "ended", "exception", "wall_seconds",
+                                        "skipped_initialization", "too_long") if key in data}
     return SimulationReport(returncode=returncode, timed_out=stopped.is_set(),
                             output="".join(tail), **known)
 
+
+def _relay(stream, tail, echo: bool) -> None:
+    """
+    Copies the run's output to the console as it comes, keeping the last lines. It reads to
+    the end whatever the console does, since the run blocks once the pipe is full.
+    """
+    for line in stream:
+        tail.append(line)
+        if echo:
+            try:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+            except (OSError, ValueError, UnicodeError):
+                echo = False
+
+
+def _interrupt(process) -> None:
+    """
+    Ctrl-C on POSIX; Ctrl-Break on Windows, which the shim takes as Ctrl-C. Either way the run
+    writes its report on the way out. Where neither can be sent, terminate.
+    """
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == "posix":
+            process.send_signal(signal.SIGINT)
+        else:
+            process.send_signal(signal.CTRL_BREAK_EVENT)
+    except (OSError, ValueError, AttributeError):
+        try:
+            process.terminate()
+        except OSError:
+            pass
+
+
+def _kill(process) -> None:
+    if process.poll() is None:
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+
+def _stop_with_this_process():
+    """
+    Makes a SIGTERM or SIGHUP to this process -- a closed terminal, `timeout`, a CI runner
+    cancelling the job -- end the run too, instead of leaving it running unattended; returns a
+    function that puts the previous handlers back. Only the main thread can install handlers;
+    elsewhere this does nothing.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return lambda: None
+    previous = {}
+
+    def leave(number, frame):
+        raise SystemExit(128 + number)
+
+    for name in ("SIGTERM", "SIGHUP"):
+        number = getattr(signal, name, None)
+        # Only the default (die) is replaced: `nohup` sets SIGHUP to ignored, and a program
+        # embedding this package may have its own handler, and both are kept as they are.
+        if number is None or signal.getsignal(number) is not signal.SIG_DFL:
+            continue
+        try:
+            previous[number] = signal.signal(number, leave)
+        except (OSError, ValueError):
+            pass
+
+    def restore():
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+    return restore
