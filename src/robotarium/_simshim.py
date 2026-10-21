@@ -23,6 +23,7 @@ import runpy
 import sys
 import time
 import traceback
+import warnings
 from pathlib import Path
 
 REPORT = {
@@ -133,6 +134,11 @@ def main() -> int:
         return 2
     main_file = Path(sys.argv[1]).resolve()
     atexit.register(write_report)
+
+    # Headless, the simulator's own plt.show() has nothing to show and matplotlib says so on
+    # every run; that warning is about how the run is watched, not about the experiment.
+    if os.environ.get("MPLBACKEND", "").lower() == "agg":
+        warnings.filterwarnings("ignore", message=".*non-interactive, and thus cannot be shown")
 
     if not install(fast=os.environ.get("ROBOTARIUM_SIM_FAST") == "1"):
         print("The Robotarium simulator (rps) is not importable: %s" % REPORT["exception"],
