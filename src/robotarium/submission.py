@@ -24,8 +24,8 @@ from pathlib import Path
 from . import credentials as credentials_module
 from . import ledger, libraries, preflight, simulate
 from .bundle import Bundle, build
-from .client import DASHBOARD_URL, RobotariumClient, RobotariumError, check_against_settings
-from .client import experiment_form
+from .client import (DASHBOARD_URL, ConnectionLost, RobotariumClient, RobotariumError,
+                     check_against_settings, experiment_form)
 from .experiment import Experiment, Project
 from .findings import ERROR, WARNING, Finding, errors, ordered
 from .limits import EXPERIMENT_TYPE
@@ -227,30 +227,44 @@ def submit(target, credentials=None, draft: bool = None, simulate_first: bool = 
     entry = _ledger_entry(prepared, draft, snapshot)
     client = RobotariumClient()
     uploaded = []
+    experiment_id = None
+    stage = "login"
     try:
         client.login(credentials.username, credentials.password)
         out("Logged in.")
 
+        stage = "settings"
         problems = check_against_settings(client.settings(), int(bundle.duration),
                                           bundle.robots, bundle.files)
         if problems:
             raise RobotariumError("the site's current limits refuse it: %s" % " ".join(problems))
 
+        stage = "upload"
         for path in bundle.files:
             uploaded.append(client.upload_file(path))
             out("Uploaded %s." % path.name)
 
+        stage = "create"
         experiment_id = client.create_experiment(experiment_form(
             bundle.title, bundle.description, int(bundle.duration), bundle.robots, uploaded,
             draft=draft))
+
+        stage = "mark-main"
         client.mark_main_file(uploaded[0], uploaded, experiment_id)
         out("Marked %s as the main file." % bundle.main.name)
-    except RobotariumError as error:
-        entry.update(outcome="failed", error=str(error), orphaned_uploads=len(uploaded))
+    except BaseException as error:
+        # Whatever stopped it -- a refusal, a dropped connection, Ctrl-C -- the attempt is
+        # recorded, with what is left on the site, before the error goes on up.
+        consequence = _consequence(stage, error, uploaded, experiment_id)
+        entry.update(outcome="interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
+                     stage=stage, error=str(error) or type(error).__name__,
+                     orphaned_uploads=len(uploaded) if experiment_id is None else 0,
+                     experiment_id=experiment_id, consequence=consequence)
         ledger.record(project.output_dir, entry)
-        if uploaded:
-            error.args = ("%s (%d file(s) were uploaded before it failed and are attached to no "
-                          "experiment)" % (error, len(uploaded)),)
+        if consequence and isinstance(error, RobotariumError):
+            error.args = ("%s. %s" % (error, consequence),)
+        elif consequence:
+            out(consequence)
         raise
 
     entry.update(outcome="submitted", experiment_id=experiment_id)
@@ -261,6 +275,21 @@ def submit(target, credentials=None, draft: bool = None, simulate_first: bool = 
     return SubmissionResult(sent=True, prepared=prepared, draft=draft,
                             experiment_id=experiment_id, snapshot=snapshot, ledger=path,
                             uploaded=uploaded)
+
+
+def _consequence(stage: str, error: BaseException, uploaded: list, experiment_id) -> str:
+    """What a failure at `stage` leaves behind on the site, as a sentence; "" for nothing."""
+    if stage == "mark-main":
+        return ("Experiment %s was created, but its main file is not marked: tick \"Main File\" "
+                "on %s rather than submitting again." % (experiment_id, DASHBOARD_URL))
+    if stage == "create" and (isinstance(error, ConnectionLost)
+                              or not isinstance(error, RobotariumError)):
+        return ("The experiment may have been created before the answer was lost: check %s "
+                "before submitting again." % DASHBOARD_URL)
+    if uploaded:
+        return ("%d file(s) were uploaded before it failed and are attached to no experiment."
+                % len(uploaded))
+    return ""
 
 
 def _ledger_entry(prepared: Prepared, draft: bool, snapshot: Path) -> dict:

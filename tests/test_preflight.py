@@ -167,6 +167,25 @@ def test_a_declared_but_unused_package_is_noted(tmp_path):
     assert "no uploaded .jl file loads it" in messages(found, INFO)
 
 
+@pytest.mark.parametrize("source, expected", [
+    ("using LinearAlgebra; using JSON3", ["LinearAlgebra", "JSON3"]),
+    ("using CSV,\n    DataFrames\n", ["CSV", "DataFrames"]),
+    ("import JSON3\tas J", ["JSON3"]),
+    ("import Foo.Bar: baz, qux", ["Foo"]),
+    ("using A: f,\n    g\nusing B", ["A", "B"]),
+    ("x = 1  # using Trailing\n", []),
+])
+def test_julia_statement_forms_are_parsed(source, expected):
+    assert julia_packages_used(source) == expected
+
+
+def test_a_second_using_on_a_line_is_not_missed(tmp_path):
+    found = findings_for(tmp_path, LOADER,
+                         files={"backend.jl": "using LinearAlgebra; using JSON3\n"})
+    assert "loads JSON3" in messages(found, ERROR)
+    assert "LinearAlgebra" not in messages(found, ERROR)
+
+
 def test_julia_usings_are_parsed():
     source = """
     module SheafBackend
@@ -180,3 +199,20 @@ def test_julia_usings_are_parsed():
     """
     assert julia_packages_used(source) == ["CellularSheaves", "JSON3", "LinearAlgebra",
                                            "Statistics"]
+
+
+def test_an_rps_folder_beside_the_main_file_is_not_a_problem(tmp_path):
+    write(tmp_path / "rps" / "__init__.py", "")
+    assert messages(findings_for(tmp_path), ERROR) == ""
+
+
+def test_the_stdlib_is_the_testbeds(tmp_path):
+    found = findings_for(tmp_path, GOOD_MAIN + "import tomllib\nimport imp\nimport distutils\n")
+    assert "tomllib is not in the standard library of Python 3.10" in messages(found, WARNING)
+    assert "imp" not in messages(found, WARNING).replace("import", "")
+    assert "distutils" not in messages(found, WARNING)
+
+
+def test_skipping_initialization_is_warned_about(tmp_path):
+    main = GOOD_MAIN.replace("show_figure=False", "show_figure=False, skip_initialization=True")
+    assert "skip_initialization" in messages(findings_for(tmp_path, main), WARNING)

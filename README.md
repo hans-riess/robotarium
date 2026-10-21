@@ -152,11 +152,13 @@ Before anything is sent, and as far as possible before anything is run:
 - **The files:** they exist; no directories; only extensions the form takes (no `.json`, `.yaml`,
   `.txt`, `.zip`); no two with the same base name.
 - **Inside the Python:**
-  - imports the testbed lacks, checked against the simulator's `libraries.txt`;
+  - imports the testbed lacks, checked against the simulator's `libraries.txt` and against
+    Python 3.10's standard library, which the testbed appears to run (so `tomllib` is flagged);
   - local modules imported but not uploaded, and package directories, which can't travel;
   - relative imports, which fail in a flat bundle;
   - `Robotarium(number_of_robots=...)` disagreeing with the form;
   - no `r.debug()` / `r.call_at_scripts_end()` at the end;
+  - `skip_initialization=True`, a drive the testbed never skips;
   - numpy spellings newer than the testbed's.
 - **Inside the Julia:** packages loaded but not declared; `include`d files not uploaded.
 - **In the simulator** (`simulate`, `submit --simulate`, or `duration = "auto"`): collisions and
@@ -215,8 +217,9 @@ backend locally exactly as the testbed will. `robotarium init --julia` is a work
   `.npz` (bundle title, commit, file hashes, notes), autosaving so that a run stopped at its
   declared duration still leaves data. `robotarium inspect` reads it.
 - **Submissions:** `.robotarium/submissions.jsonl` records every attempt, successful or not,
-  with the experiment id, form values and file hashes. A zip snapshot of exactly what was
-  uploaded goes to `.robotarium/snapshots/`. It holds no credentials and is safe to commit.
+  with the experiment id, form values and file hashes. A failed attempt also records the stage
+  it failed at and what it left on the site. A zip snapshot of exactly what was uploaded goes to
+  `.robotarium/snapshots/`. It holds no credentials and is safe to commit.
 - **The tool:** `-v` and `--log-file` show each step and each API call (never a body or a
   secret).
 

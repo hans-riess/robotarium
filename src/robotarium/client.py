@@ -26,6 +26,7 @@ module. docs/site-api.md says how it was read and how to re-read it.
 Standard library only: urllib honours HTTPS_PROXY and the system's certificate store on its own.
 """
 
+import http.client
 import json
 import logging
 import mimetypes
@@ -53,6 +54,13 @@ log = logging.getLogger(__name__)
 
 class RobotariumError(RuntimeError):
     """The site refused a request, with the reason it gave. Never carries the credentials."""
+
+
+class ConnectionLost(RobotariumError):
+    """
+    A request was sent and no answer came back: the connection dropped or timed out. Unlike a
+    refusal, the site may have acted on it -- an experiment may exist although create failed.
+    """
 
 
 def api_url() -> str:
@@ -175,6 +183,11 @@ class RobotariumClient:
                 method, path, error.code, _reason(_decode(error.read()), error.reason))) from None
         except urllib.error.URLError as error:
             raise RobotariumError("Could not reach %s: %s" % (self.url, error.reason)) from None
+        except (OSError, http.client.HTTPException) as error:
+            # Raised from reading the reply, which urllib does not wrap: the request went out.
+            log.debug("%s %s -> no answer (%s)", method, path, type(error).__name__)
+            raise ConnectionLost("%s %s got no answer: %s" % (
+                method, path, error or type(error).__name__)) from None
 
         return _decode(payload)
 

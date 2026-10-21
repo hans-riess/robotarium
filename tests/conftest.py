@@ -54,6 +54,10 @@ class FakeRobotarium(BaseHTTPRequestHandler):
     requests = []
     settings = {"allowedFileExt": [".py", ".jl", ".m", ".npy"], "maxDuration": 600,
                 "minRbt": 1, "maxRbt": 20}
+    #: A path to answer with nothing at all, closing the connection: a dropped request.
+    drop = None
+    #: A reply to give to the main-file PUT instead of success.
+    mark_main_reply = {"message": "updated"}
 
     def log_message(self, *arguments):
         pass
@@ -85,6 +89,9 @@ class FakeRobotarium(BaseHTTPRequestHandler):
 
     def do_POST(self):
         record = self._record()
+        if self.path == type(self).drop:
+            self.close_connection = True
+            return
         if self.path == "/api/auth/login":
             if record["json"] == {"email": USERNAME, "password": encrypt_password(PASSWORD)}:
                 return self._reply({"token": "jwt-token", "username": "someone"})
@@ -104,7 +111,7 @@ class FakeRobotarium(BaseHTTPRequestHandler):
 
     def do_PUT(self):
         self._record()
-        return self._reply({"message": "updated"})
+        return self._reply(type(self).mark_main_reply)
 
 
 @pytest.fixture

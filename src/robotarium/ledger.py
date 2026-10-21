@@ -74,7 +74,10 @@ def describe(entry: dict) -> str:
         status = "experiment %s %s" % (entry.get("experiment_id"),
                                        "saved as a draft" if entry.get("draft") else "queued")
     else:
-        status = "FAILED: %s" % entry.get("error", "no reason recorded")
+        status = "%s%s: %s" % (outcome.upper(), " at %s" % entry["stage"] if entry.get("stage")
+                               else "", entry.get("error", "no reason recorded"))
+        if entry.get("consequence"):
+            status += "\n    %s" % entry["consequence"]
     lines = ["%s  %s" % (entry.get("submitted_at", "?"), entry.get("title", "?")),
              "    %s" % status,
              "    %s robots, %s s, main %s, %d file(s)%s" % (

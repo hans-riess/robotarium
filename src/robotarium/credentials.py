@@ -21,6 +21,7 @@ two stores `robotarium login` is explicitly asked to use. docs/credentials.md is
 
 import getpass
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -75,8 +76,10 @@ def user_credentials_file() -> Path:
 
 def read_env_file(path: Path) -> dict:
     """
-    KEY=VALUE pairs from a dotenv file: blank lines and # comments skipped, an `export ` prefix
-    and matching quotes around a value stripped. Nothing is interpolated.
+    KEY=VALUE pairs from a dotenv file, read as dotenv does: blank lines and # comments skipped,
+    an `export ` prefix allowed. A value in double quotes keeps everything inside them, with
+    \\, \" and \\n escapes; in single quotes, everything literally. An unquoted value ends at
+    a ` #` comment and has its surrounding whitespace stripped. Nothing is interpolated.
 
     Args:
         path (Path): The file.
@@ -90,11 +93,32 @@ def read_env_file(path: Path) -> dict:
         key = key.strip()
         if key.startswith("export "):
             key = key[len("export "):].strip()
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        values[key] = value
+        values[key] = _env_value(value.lstrip())
     return values
+
+
+def _env_value(text: str) -> str:
+    """One value, as read_env_file describes."""
+    if text[:1] == '"':
+        value, escaped = [], False
+        for character in text[1:]:
+            if escaped:
+                value.append({"n": "\n"}.get(character, character))
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                return "".join(value)
+            else:
+                value.append(character)
+    elif text[:1] == "'" and "'" in text[1:]:
+        return text[1:text.index("'", 1)]
+    return re.split(r"\s#", text, maxsplit=1)[0].strip()
+
+
+def _quote(value: str) -> str:
+    """A value written so that _env_value reads it back exactly."""
+    return '"%s"' % value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 
 def env_file_candidates(project_root: Path = None, env_file: Path = None) -> list:
@@ -292,7 +316,7 @@ def _write_private(path: Path, values: dict) -> None:
     """Writes a dotenv file that only this user can read, creating it that way from the start."""
     path.parent.mkdir(parents=True, exist_ok=True)
     text = "# Written by `robotarium login`. Remove with `robotarium logout`.\n" + "".join(
-        "%s=%s\n" % (key, value) for key, value in values.items())
+        "%s=%s\n" % (key, _quote(value)) for key, value in values.items())
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
         handle.write(text)

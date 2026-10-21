@@ -119,3 +119,66 @@ r.debug()
     bundle = build(experiment, tmp_path / ".robotarium")
     report = simulate.run(bundle, echo=False, timeout=300)
     assert "too close" in levels(report.findings(experiment), ERROR)
+
+
+def test_a_timeout_is_reported_as_one():
+    report = SimulationReport(returncode=-2, timed_out=True, steps=40)
+    found = report.findings(experiment())
+    assert "stopped at the timeout, after 40 steps" in levels(found, ERROR)
+
+
+def _bundle_of(tmp_path, source, robots=2):
+    write(tmp_path / "main.py", source)
+    experiment = Experiment(title="T", description="D", duration=60, robots=robots,
+                            main="main.py", root=tmp_path)
+    return experiment, build(experiment, tmp_path / ".robotarium")
+
+
+@needs_simulator
+def test_initialization_is_never_skipped(tmp_path):
+    experiment, bundle = _bundle_of(tmp_path, """\
+import numpy as np
+import rps.robotarium as robotarium
+poses = np.array([[-0.5, 0.5], [0.0, 0.0], [0.0, 0.0]])
+r = robotarium.Robotarium(number_of_robots=2, initial_conditions=poses, skip_initialization=True)
+for _ in range(10):
+    r.get_poses()
+    r.step()
+r.debug()
+""")
+    report = simulate.run(bundle, echo=False, timeout=300)
+    assert report.init_steps > 0 and report.steps == 10 and report.skipped_initialization
+    assert "overridden" in " ".join(each.message for each in report.findings(experiment))
+
+
+@needs_simulator
+def test_a_timed_out_run_still_reports(tmp_path):
+    experiment, bundle = _bundle_of(tmp_path, """\
+import rps.robotarium as robotarium
+r = robotarium.Robotarium(number_of_robots=2)
+while True:
+    r.get_poses()
+    r.step()
+""")
+    report = simulate.run(bundle, echo=False, timeout=8)
+    assert report.timed_out and report.robots == [2] and report.steps > 0
+    assert "stopped at the timeout" in levels(report.findings(experiment), ERROR)
+
+
+@needs_simulator
+def test_the_run_never_sees_the_login(tmp_path, monkeypatch):
+    monkeypatch.setenv("ROBOTARIUM_PASSWORD", "hunter2-secret")
+    monkeypatch.setenv("ROBOTARIUM_USERNAME", "someone@example.edu")
+    experiment, bundle = _bundle_of(tmp_path, """\
+import os
+print("seen:", os.environ.get("ROBOTARIUM_PASSWORD"), os.environ.get("ROBOTARIUM_USERNAME"))
+""")
+    report = simulate.run(bundle, echo=False, timeout=60)
+    assert "seen: None None" in report.output
+
+
+@needs_simulator
+def test_an_exit_message_is_kept(tmp_path):
+    experiment, bundle = _bundle_of(tmp_path, "import sys\nsys.exit('bad parameters')\n")
+    report = simulate.run(bundle, echo=False, timeout=60)
+    assert report.returncode == 1 and "bad parameters" in report.output

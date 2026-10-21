@@ -48,6 +48,12 @@ simulator saw:
 | whether `r.debug()` or `r.call_at_scripts_end()` ran | a **warning** if not: the Robotarium requires it |
 | the exit status | an **error** if the main file failed, with its last line |
 
+Two things are always as on the testbed, whatever the main file asks for. The robots are
+driven to their initial poses first, even if the main file passes `skip_initialization=True`,
+because the testbed always does that drive and a run without it is shorter than the real one.
+And the run never sees `ROBOTARIUM_USERNAME` or `ROBOTARIUM_PASSWORD`. A `--timeout` stops the
+run with Ctrl-C, so the report is still written and says the run timed out.
+
 The wall clock is also compared with the declared duration. A run longer than its estimated
 duration is an error, because the testbed stops it, and the message suggests a duration with
 headroom. `duration = "auto"` uses that suggestion.

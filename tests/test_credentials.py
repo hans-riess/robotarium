@@ -125,3 +125,16 @@ def test_login_to_the_keyring_keeps_the_password_out_of_the_file(monkeypatch):
 
 def test_an_email_is_masked():
     assert credentials.mask("hans@gmail.com") == "h***@g***.com"
+
+
+@pytest.mark.parametrize("password", ['"quoted"', " spaced ", "hash # inside", "back\\slash",
+                                      "it's", "#start", "new\nline"])
+def test_any_password_survives_the_credentials_file(password):
+    credentials.store(USERNAME, password, where="file")
+    assert resolve(interactive=False).password == password
+
+
+def test_dotenv_values_read_as_dotenv_does(tmp_path):
+    env = write(tmp_path / "x.env", "A=x  # note\nB='single # kept'\nC=\"dq\" # c\nD=a#b\n")
+    assert credentials.read_env_file(env) == {"A": "x", "B": "single # kept", "C": "dq",
+                                              "D": "a#b"}

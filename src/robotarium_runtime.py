@@ -348,7 +348,8 @@ class RunLogger:
         self.echo = echo
         self._series = {}
         self._steps = {}
-        self._count = 0
+        self._next_step = 0
+        self._records = 0
         self._dirty = False
         built = bundle().get("experiment") or {}
         self.meta = {"name": name, "started_at": self.started.isoformat(timespec="seconds"),
@@ -364,22 +365,26 @@ class RunLogger:
         from step to step.
 
         Args:
-            step (int): The step this is; default one more than the last record() call's.
+            step (int): The step this is; default one more than the last step recorded.
             **values: Arrays or numbers, e.g. poses=x, velocities=dxu, error=0.12.
         """
-        step = self._count if step is None else int(step)
-        for key, value in values.items():
-            array = np.array(value, copy=True)
-            series = self._series.setdefault(key, [])
+        step = self._next_step if step is None else int(step)
+        arrays = {key: np.array(value, copy=True) for key, value in values.items()}
+        # Every value is checked before any is kept, so a refused record leaves no series a
+        # step longer than the others.
+        for key, array in arrays.items():
+            series = self._series.get(key)
             if series and series[0].shape != array.shape:
                 raise ValueError("RunLogger: %r was recorded with shape %s and now %s. Record "
                                  "a quantity with the same shape at every step."
                                  % (key, series[0].shape, array.shape))
-            series.append(array)
+        for key, array in arrays.items():
+            self._series.setdefault(key, []).append(array)
             self._steps.setdefault(key, []).append(step)
-        self._count = step + 1
+        self._next_step = step + 1
+        self._records += 1
         self._dirty = True
-        if self.autosave_every and self._count % self.autosave_every == 0:
+        if self.autosave_every and self._records % self.autosave_every == 0:
             self.save()
 
     def note(self, message: str, step=None) -> None:
@@ -390,7 +395,7 @@ class RunLogger:
             message (str): The remark.
             step (int): The step it is about; default the current one.
         """
-        step = self._count if step is None else int(step)
+        step = self._next_step if step is None else int(step)
         self.meta["notes"].append({"step": step, "seconds": round(step * STEP_SECONDS, 3),
                                    "message": str(message)})
         self._dirty = True
@@ -404,7 +409,7 @@ class RunLogger:
             arrays[key] = np.stack(series)
             arrays["__steps__" + key] = np.asarray(self._steps[key], dtype=np.int64)
         meta = dict(self.meta, saved_at=datetime.datetime.now().astimezone().isoformat(
-            timespec="seconds"), records=self._count)
+            timespec="seconds"), records=self._records)
         arrays["__meta__"] = np.array(json.dumps(meta, default=_jsonable))
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # Written aside and moved into place, so a run killed mid-write leaves the last

@@ -202,3 +202,10 @@ def test_a_config_that_is_not_plain_data_is_an_error(tmp_path):
 def test_a_matlab_main_file_is_accepted(tmp_path):
     write(tmp_path / "main.m", "r = Robotarium('NumberOfRobots', 4);\n")
     assert errors(experiment(tmp_path, main="main.m").check()) == []
+
+
+def test_globs_work_under_a_directory_with_brackets(tmp_path):
+    root = tmp_path / "exp[1]"
+    write(root / "data" / "a.npy", "")
+    paths = experiment(root, files=["data/*.npy"]).upload_files()
+    assert [path.name for path in paths] == ["main.py", "a.npy"]

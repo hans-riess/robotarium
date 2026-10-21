@@ -22,7 +22,8 @@ from pathlib import Path
 
 from .experiment import BUNDLE_MODULE, GENERATED_NAMES, RUNTIME_MODULE
 from .findings import ERROR, INFO, WARNING, Finding
-from .libraries import stdlib_modules
+from .libraries import (ALWAYS_AVAILABLE, TESTBED_PYTHON, newer_stdlib_modules,
+                        stdlib_modules)
 
 #: Spellings that work on the machine a bundle is built on and fail on the one that runs it.
 #: This list is what has cost a round trip on robosheaf and its sibling project, not a model of
@@ -146,6 +147,7 @@ def _is_type_checking(test: ast.AST) -> bool:
 def _check_imports(path: Path, tree: ast.AST, names: set, experiment, libraries) -> list:
     findings = []
     stdlib = stdlib_modules()
+    newer = newer_stdlib_modules()
     allowed = set(experiment.allow_imports or ())
     local_roots = {experiment.root, Path(experiment.main).parent}
 
@@ -156,7 +158,16 @@ def _check_imports(path: Path, tree: ast.AST, names: set, experiment, libraries)
                                            "Import the module by name: the bundle is flat."
                                            % ("." * level, module), file=path.name, line=line))
             continue
-        if not module or module in stdlib or module in allowed or "%s.py" % module in names:
+        # The Robotarium's own API is there whatever is on disk here: a project inside a
+        # simulator clone has an rps/ beside it, and must not be told rps cannot travel.
+        if not module or module in stdlib or module in allowed or module in ALWAYS_AVAILABLE \
+                or "%s.py" % module in names:
+            continue
+        if module in newer and not optional:
+            findings.append(Finding(WARNING, "%s is not in the standard library of Python %s, "
+                                             "which the testbed appears to run (its "
+                                             "libraries.txt ships backports such as tomli)."
+                                    % (module, TESTBED_PYTHON), file=path.name, line=line))
             continue
         if module == "robotarium":
             findings.append(Finding(ERROR, "The robotarium package exists only on this machine. "
@@ -229,6 +240,14 @@ def _check_main(main: Path, trees: dict, experiment) -> list:
         if not (isinstance(node, ast.Call) and _call_name(node.func) == "Robotarium"):
             continue
         for keyword in node.keywords:
+            if keyword.arg == "skip_initialization" and not (
+                    isinstance(keyword.value, ast.Constant) and keyword.value.value is False):
+                findings.append(Finding(WARNING, "skip_initialization: the testbed always drives "
+                                                 "the robots to their initial poses first, so "
+                                                 "a run without that drive is not the run it "
+                                                 "will do (robotarium simulate does the drive "
+                                                 "regardless).", file=main.name,
+                                        line=node.lineno))
             if keyword.arg != "number_of_robots":
                 continue
             value = keyword.value
@@ -269,23 +288,37 @@ def _module_int_constants(tree: ast.Module) -> dict:
 # Julia
 # ---------------------------------------------------------------------------
 
-_USING = re.compile(r"^\s*(?:using|import)\s+([^#\n]+)", re.MULTILINE)
 _INCLUDE = re.compile(r"\binclude\(\s*\"([^\"]+)\"\s*\)")
+_STATEMENT = re.compile(r"^\s*(?:using|import)\s+(.*)$", re.DOTALL)
+_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_!]*")
 
 
 def julia_packages_used(source: str) -> list:
     """
     The packages a Julia source loads with `using` or `import`, in order, without repeats.
-    Relative imports (`using .Inner`) are the file's own modules and are left out.
+
+    Handles several statements on a line (`using A; using B`), a list continued over lines
+    (`using A,` / `B`), `using A: f, g`, `import A as B` and `import A.Sub`. Relative imports
+    (`using .Inner`) are the file's own modules and are left out.
     """
-    source = re.sub(r"#=.*?=#", "", source, flags=re.DOTALL)
+    source = re.sub(r"#=.*?=#", " ", source, flags=re.DOTALL)
+    source = re.sub(r"#[^\n]*", "", source)
+    # A list that ends a line with a comma continues on the next.
+    source = re.sub(r",[ \t]*\n", ", ", source)
     used = []
-    for match in _USING.finditer(source):
-        clause = match.group(1).split(":")[0]
-        for item in clause.split(","):
-            name = item.strip().split(" ")[0].split(".")[0]
-            if name and not item.strip().startswith(".") and name not in used:
-                used.append(name)
+    for line in source.splitlines():
+        for statement in line.split(";"):
+            match = _STATEMENT.match(statement)
+            if not match:
+                continue
+            clause = match.group(1).split(":")[0]
+            for item in clause.split(","):
+                item = item.strip()
+                if item.startswith("."):
+                    continue
+                name = _NAME.match(item)
+                if name and name.group(0) not in used:
+                    used.append(name.group(0))
     return used
 
 

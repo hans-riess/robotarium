@@ -11,7 +11,8 @@ experiment ended with debug() or call_at_scripts_end(). It writes all of that as
 in $ROBOTARIUM_SIM_REPORT when the main file finishes, however it finishes.
 
 $ROBOTARIUM_SIM_FAST=1 turns off the simulator's real-time pacing, which changes how long the
-run takes to watch and nothing about what it does.
+run takes to watch and nothing about what it does. skip_initialization is always turned off,
+since the testbed always drives the robots to their initial poses first.
 """
 
 import atexit
@@ -32,6 +33,7 @@ REPORT = {
     "ended": False,
     "exception": None,
     "wall_seconds": None,
+    "skipped_initialization": False,
 }
 
 _INSTANCES = []
@@ -55,6 +57,13 @@ def install(fast: bool) -> bool:
     def __init__(self, *args, **kwargs):
         if fast:
             kwargs["sim_in_real_time"] = False
+        # The testbed always drives the robots to their initial poses; a run that skips the
+        # drive is shorter than the one the testbed will do, and starts from somewhere else.
+        if kwargs.get("skip_initialization"):
+            print("robotarium simulate: ignoring skip_initialization=True -- the testbed always "
+                  "drives the robots to their initial poses first.", file=sys.stderr)
+            REPORT["skipped_initialization"] = True
+        kwargs["skip_initialization"] = False
         REPORT["robots"].append(kwargs.get("number_of_robots", -1))
         _INSTANCES.append(self)
         original_init(self, *args, **kwargs)
@@ -114,7 +123,12 @@ def main() -> int:
         runpy.run_path(str(main_file), run_name="__main__")
     except SystemExit as exit_:
         code = exit_.code
-        return code if isinstance(code, int) else (0 if code is None else 1)
+        if code is None or isinstance(code, int):
+            return code or 0
+        # sys.exit("message"): Python prints the message and exits 1, and so does this.
+        print(code, file=sys.stderr)
+        REPORT["exception"] = "SystemExit: %s" % code
+        return 1
     except BaseException:  # noqa: BLE001 -- the report is the point; the traceback is printed
         REPORT["exception"] = traceback.format_exc(limit=-8)
         traceback.print_exc()

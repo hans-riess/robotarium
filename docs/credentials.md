@@ -70,8 +70,12 @@ export ROBOTARIUM_ENV_FILE=~/.secrets/robotarium.env
 - that, inside a git repository, git ignores it (fix by adding `.env` to `.gitignore`). If it
   isn't ignored, the next `git add .` commits your password.
 
-The format is plain `KEY=VALUE`. Blank lines, `# comments`, an `export ` prefix and quotes around
-the value are all accepted. Nothing is interpolated.
+The format is plain `KEY=VALUE`, read as dotenv reads it. Blank lines, `# comments` and an
+`export ` prefix are accepted. An unquoted value ends at a ` #` comment and loses surrounding
+spaces, so **quote a password that has leading or trailing spaces or a ` #`** in it: inside
+`"double quotes"` everything is kept (write `\"` and `\\` for a quote and a backslash), and
+inside `'single quotes'` everything is kept literally. Nothing is interpolated. `robotarium
+login --store file` quotes for you.
 
 ### 3. Environment variables
 

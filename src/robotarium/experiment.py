@@ -16,6 +16,7 @@ docs/manifest.md is the reference for every key a robotarium.toml may hold.
 import datetime
 import glob
 import json
+import os
 import re
 import subprocess
 import tomllib
@@ -138,9 +139,13 @@ class Experiment:
         return unique
 
     def _expand(self, entry) -> list:
-        pattern = str(self._resolve(entry))
-        if not glob.has_magic(pattern):
+        entry = Path(entry).expanduser()
+        if not glob.has_magic(str(entry)):
             return []
+        # Only the entry is a pattern: a project under a path such as exp[1]/ must not have its
+        # own directory read as one.
+        pattern = str(entry) if entry.is_absolute() else \
+            os.path.join(glob.escape(str(self.root)), str(entry))
         return sorted(Path(each) for each in glob.glob(pattern, recursive=True)
                       if Path(each).is_file())
 
@@ -328,7 +333,8 @@ def parse_duration(value):
     A duration in whole seconds, rounded up, or "auto".
 
         parse_duration(90) == parse_duration("90") == parse_duration("90s") == 90
-        parse_duration("2m") == 120;  parse_duration("1m30s") == 90;  parse_duration("1.5 min") == 90
+        parse_duration("2m") == 120
+        parse_duration("1m30s") == parse_duration("1.5 min") == 90
 
     Args:
         value: An int or float of seconds, or a string as above.

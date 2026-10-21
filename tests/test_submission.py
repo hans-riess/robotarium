@@ -10,6 +10,7 @@ import json
 import pytest
 
 from robotarium import ledger
+from robotarium.client import ConnectionLost, RobotariumClient, RobotariumError
 from robotarium.experiment import Experiment, Project
 from robotarium.submission import SubmissionRefused, submit
 
@@ -162,3 +163,48 @@ def test_a_matlab_main_file_is_not_simulated(tmp_path, fake_site, logged_in):
     result = submit(experiment, confirm=False, out=lambda *_: None)
     uploads = [each["filename"] for each in fake_site if each["path"] == "/api/files/upload"]
     assert result.sent and uploads == ["main.m"]
+
+
+# ---------------------------------------------------------------------------
+# failures part-way through: always recorded, and what they leave on the site named
+# ---------------------------------------------------------------------------
+
+def test_a_dropped_create_is_recorded_as_possibly_created(project, fake_site, logged_in,
+                                                          monkeypatch):
+    monkeypatch.setattr(FakeRobotarium, "drop", "/api/experiment/create")
+    with pytest.raises(RobotariumError, match="may have been created") as error:
+        submit(project, confirm=False, out=lambda *_: None)
+    assert isinstance(error.value, ConnectionLost)
+    entry = ledger.read(project.output_dir)[-1]
+    assert (entry["outcome"], entry["stage"]) == ("failed", "create")
+    assert "check" in entry["consequence"] and "got no answer" in entry["error"]
+
+
+def test_a_refused_main_file_mark_names_the_created_experiment(project, fake_site, logged_in,
+                                                               monkeypatch):
+    monkeypatch.setattr(FakeRobotarium, "mark_main_reply",
+                        {"status": "error", "message": "no such file"})
+    with pytest.raises(RobotariumError, match="Experiment exp-1 was created"):
+        submit(project, confirm=False, out=lambda *_: None)
+    entry = ledger.read(project.output_dir)[-1]
+    assert (entry["stage"], entry["experiment_id"]) == ("mark-main", "exp-1")
+
+
+def test_an_interrupted_upload_is_recorded(project, fake_site, logged_in, monkeypatch):
+    real_upload = RobotariumClient.upload_file
+    calls = []
+
+    def upload(self, path):
+        calls.append(path)
+        if len(calls) == 2:
+            raise KeyboardInterrupt
+        return real_upload(self, path)
+
+    monkeypatch.setattr(RobotariumClient, "upload_file", upload)
+    printed = []
+    with pytest.raises(KeyboardInterrupt):
+        submit(project, confirm=False, out=printed.append)
+    entry = ledger.read(project.output_dir)[-1]
+    assert (entry["outcome"], entry["stage"], entry["orphaned_uploads"]) == \
+        ("interrupted", "upload", 1)
+    assert any("attached to no experiment" in line for line in printed)

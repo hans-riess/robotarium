@@ -30,6 +30,7 @@ import collections
 import json
 import logging
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -38,6 +39,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import limits
+from .credentials import PASSWORD_VARIABLE, USERNAME_VARIABLE
 from .findings import ERROR, INFO, WARNING, Finding
 
 SIMULATOR_VARIABLE = "ROBOTARIUM_SIMULATOR"
@@ -66,6 +68,7 @@ class SimulationReport:
     ended: bool = False
     exception: str = None
     wall_seconds: float = None
+    skipped_initialization: bool = False
     output: str = ""
 
     @property
@@ -92,6 +95,10 @@ class SimulationReport:
         findings = []
         add = findings.append
 
+        if self.timed_out:
+            add(Finding(ERROR, "The run was stopped at the timeout, after %d steps."
+                               % self.total_steps))
+            return findings
         if self.rps is None:
             if self.returncode == 3:
                 add(Finding(ERROR, "The simulator (rps) is not importable. Install it (pip "
@@ -103,10 +110,7 @@ class SimulationReport:
                 add(Finding(ERROR, "The run ended before the simulator could report (exit %d): "
                                    "%s" % (self.returncode, last[0])))
             return findings
-        if self.timed_out:
-            add(Finding(ERROR, "The run was stopped at the timeout, after %d steps."
-                               % self.total_steps))
-        elif self.returncode != 0:
+        if self.returncode != 0:
             last = (self.exception or self.output).strip().splitlines()[-1:] or ["no output"]
             add(Finding(ERROR, "The main file failed in the simulator (exit %d): %s"
                                % (self.returncode, last[0])))
@@ -137,6 +141,9 @@ class SimulationReport:
             add(Finding(WARNING, "The run never called r.debug() (or r.call_at_scripts_end()), "
                                  "which the Robotarium requires at the end."))
 
+        if self.skipped_initialization:
+            add(Finding(INFO, "skip_initialization=True was overridden: the robots were driven "
+                              "to their initial poses first, as on the testbed."))
         if self.total_steps:
             add(Finding(INFO, "%d steps (%d driving to the initial poses): about %.0f s on the "
                               "testbed. Suggested estimated duration: %d s."
@@ -188,7 +195,9 @@ def run(bundle, simulator=None, fast: bool = True, headless: bool = True, timeou
     """
     if bundle.main.suffix != ".py":
         raise ValueError("Only a Python main file can be simulated, not %s." % bundle.main.name)
-    environment = dict(os.environ)
+    # The experiment is the user's code, but it has no business with the Robotarium login.
+    environment = {key: value for key, value in os.environ.items()
+                   if key not in (USERNAME_VARIABLE, PASSWORD_VARIABLE)}
     checkout = simulator_path(simulator)
     if checkout:
         environment["PYTHONPATH"] = os.pathsep.join(
@@ -214,8 +223,19 @@ def run(bundle, simulator=None, fast: bool = True, headless: bool = True, timeou
         timer = None
         if timeout:
             def stop():
+                # Ctrl-C first, so the shim's report is still written; a kill if that is
+                # ignored.
                 stopped.set()
-                process.kill()
+                try:
+                    if os.name == "posix":
+                        process.send_signal(signal.SIGINT)
+                    else:
+                        process.terminate()
+                except OSError:
+                    pass
+                killer = threading.Timer(10.0, process.kill)
+                killer.daemon = True
+                killer.start()
             timer = threading.Timer(float(timeout), stop)
             timer.start()
         try:
@@ -236,7 +256,8 @@ def run(bundle, simulator=None, fast: bool = True, headless: bool = True, timeou
             data = json.loads(report_path.read_text(encoding="utf-8"))
 
     known = {key: data[key] for key in ("rps", "robots", "init_steps", "steps", "errors",
-                                        "ended", "exception", "wall_seconds") if key in data}
+                                        "ended", "exception", "wall_seconds",
+                                        "skipped_initialization") if key in data}
     return SimulationReport(returncode=returncode, timed_out=stopped.is_set(),
                             output="".join(tail), **known)
 
