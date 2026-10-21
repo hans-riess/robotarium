@@ -128,7 +128,7 @@ started, file included. It then prints the module and what it exports. The first
 Julia and the packages into your environment, which takes a few minutes.
 
 ```bash
-pip install "robotarium[julia]"     # juliacall, which brings juliapkg
+pip install -e ".[julia]"     # in your clone, venv active: juliacall, which brings juliapkg
 robotarium julia check
 ```
 

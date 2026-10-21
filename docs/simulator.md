@@ -10,7 +10,7 @@ will.
 `rps` isn't on PyPI. Use any one of these:
 
 ```bash
-pip install "robotarium[sim]"     # numpy, matplotlib, cvxopt and rps from git
+pip install -e ".[sim]"     # in your clone, venv active: numpy, matplotlib, cvxopt, rps from git
 
 # or a clone you can read and edit, installed editable:
 git clone https://github.com/robotarium/robotarium_python_simulator

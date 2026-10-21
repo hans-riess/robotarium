@@ -1,0 +1,33 @@
+# A two-robot example to try the robotarium CLI on, from `robotarium check` to a real (draft)
+# submission:
+#
+#     robotarium init try_robotarium --example two_robots
+#     cd try_robotarium
+#     robotarium check              # every offline check
+#     robotarium simulate --show    # watch it in the Robotarium simulator
+#     robotarium submit --dry-run   # exactly what would be sent
+#     robotarium login              # once
+#     robotarium submit             # saved on the Robotarium as a draft
+#     robotarium history
+
+[experiment]
+title = "Two robots swap places ({timestamp})"
+# A trailing backslash joins the lines, so the form gets one paragraph.
+description = """\
+Two GRITSBots start 1.2 m apart, facing each other, and drive to each other's starting \
+point; a barrier certificate keeps them apart as they pass. The run ends when both arrive.\
+"""
+duration = "auto"     # measured in the simulator before submitting
+robots = 2
+main = "main.py"
+
+[config]
+max_iterations = 1500
+
+[simulator]
+fast = true
+headless = true
+
+[submit]
+draft = true          # saved on the site, not queued for the physical robots
+simulate = true       # refuse to submit anything the simulator rejects

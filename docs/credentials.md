@@ -24,7 +24,7 @@ robotarium credentials --verify   # ... and log in once to check them
 ### 1. The system keyring (recommended)
 
 ```bash
-pip install "robotarium[keyring]"     # or: pip install keyring
+pip install -e ".[keyring]"     # in your clone, venv active; or: pip install keyring
 robotarium login --verify
 ```
 

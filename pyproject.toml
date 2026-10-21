@@ -43,10 +43,11 @@ py-modules = ["robotarium_runtime"]
 where = ["src"]
 
 [tool.setuptools.package-data]
-robotarium = ["data/*.txt"]
+robotarium = ["data/*.txt", "examples/*/*.py", "examples/*/*.toml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
     "simulator: runs the Robotarium simulator (rps); skipped where it is not installed",
+    "live: submits to the real Robotarium; skipped unless ROBOTARIUM_LIVE_TEST=1",
 ]

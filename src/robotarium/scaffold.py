@@ -3,10 +3,12 @@
 
     robotarium init my_experiment               a Python experiment
     robotarium init my_experiment --julia       ... with a backend.jl, the robosheaf way
+    robotarium init my_test --example two_robots    a ready-made example, to try the CLI on
 
 Every file is a starting point to edit, and none is overwritten unless --force is given.
 """
 
+from importlib import resources
 from pathlib import Path
 
 MANIFEST = '''\
@@ -265,6 +267,43 @@ def create(directory, julia: bool = False, robots: int = 4, title: str = None,
     written = []
     for name, text in files.items():
         path = directory / name
+        if path.exists() and not force:
+            written.append((path, False))
+            continue
+        path.write_text(text, encoding="utf-8")
+        written.append((path, True))
+    return written
+
+
+def examples() -> list:
+    """The names of the examples shipped with the package (robotarium/examples/)."""
+    root = resources.files("robotarium").joinpath("examples")
+    return sorted(each.name for each in root.iterdir()
+                  if each.is_dir() and each.joinpath("robotarium.toml").is_file())
+
+
+def create_example(name: str, directory, force: bool = False) -> list:
+    """
+    Copies a shipped example into `directory`, with the same .gitignore and .env.example
+    `create` writes, and returns (path, written) for each file as `create` does.
+
+    Args:
+        name (str): One of examples().
+        directory: Where; created if missing.
+        force (bool): Overwrite files that exist.
+    """
+    if name not in examples():
+        raise ValueError("No example %r; there is %s." % (name, ", ".join(examples())))
+    source = resources.files("robotarium").joinpath("examples", name)
+    files = {each.name: each.read_text(encoding="utf-8") for each in source.iterdir()
+             if each.is_file() and not each.name.endswith((".pyc", ".pyo"))}
+    files.update({".gitignore": GITIGNORE, ".env.example": ENV_EXAMPLE})
+
+    directory = Path(directory).expanduser().resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    written = []
+    for file_name, text in sorted(files.items()):
+        path = directory / file_name
         if path.exists() and not force:
             written.append((path, False))
             continue

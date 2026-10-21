@@ -75,8 +75,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     command = commands.add_parser("init", help="write a new experiment that runs as it stands")
     command.add_argument("directory", type=Path, nargs="?", default=Path("."))
-    command.add_argument("--julia", action="store_true", help="with a backend.jl, loaded the "
-                                                              "robosheaf way")
+    kind = command.add_mutually_exclusive_group()
+    kind.add_argument("--julia", action="store_true", help="with a backend.jl, loaded the "
+                                                           "robosheaf way")
+    kind.add_argument("--example", choices=scaffold.examples(), metavar="NAME",
+                      help="a ready-made example to try the CLI on: %s"
+                           % ", ".join(scaffold.examples()))
     command.add_argument("--robots", type=int, default=4, help="number of robots (default 4)")
     command.add_argument("--title", help="the experiment's title (default from the directory)")
     command.add_argument("--force", action="store_true", help="overwrite files that exist")
@@ -214,16 +218,24 @@ def configure_logging(verbose: bool, log_file: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def run_init(arguments) -> int:
-    written = scaffold.create(arguments.directory, julia=arguments.julia,
-                              robots=arguments.robots, title=arguments.title,
-                              force=arguments.force)
+    if arguments.example:
+        written = scaffold.create_example(arguments.example, arguments.directory,
+                                          force=arguments.force)
+    else:
+        written = scaffold.create(arguments.directory, julia=arguments.julia,
+                                  robots=arguments.robots, title=arguments.title,
+                                  force=arguments.force)
     for path, fresh in written:
         print("  %s %s" % ("wrote  " if fresh else "kept   ", path))
     directory = arguments.directory
-    print("\nNext:\n  cd %s\n  robotarium simulate --show    # needs the simulator: see "
-          "docs/simulator.md\n  robotarium submit --dry-run" % directory)
+    print("\nNext:\n  cd %s\n  robotarium check\n  robotarium simulate --show    # needs the "
+          "simulator: see docs/simulator.md\n  robotarium submit --dry-run" % directory)
     if arguments.julia:
         print("  robotarium julia check        # load backend.jl here, as the testbed will")
+    if arguments.example:
+        print("  robotarium login              # once: keeps your Robotarium login safely\n"
+              "  robotarium submit             # saves it on the Robotarium as a DRAFT\n"
+              "  robotarium history")
     return 0
 
 
