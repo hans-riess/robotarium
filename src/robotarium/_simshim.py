@@ -45,11 +45,19 @@ _STARTED = time.time()
 MAX_STEPS = int(os.environ.get("ROBOTARIUM_SIM_MAX_STEPS") or 0)
 
 
-class TooLong(BaseException):
+def stop_too_long() -> None:
     """
-    Raised from step() past MAX_STEPS. A BaseException, so the main file's own `except
-    Exception` cannot swallow it and loop on.
+    Ends the run past MAX_STEPS, report written first. Not by raising: an exception from
+    step() can be caught by the main file -- a bare `except:` would catch even a
+    BaseException -- and a loop around it would then spin for ever.
     """
+    REPORT["too_long"] = True
+    print("robotarium simulate: stopped after %d steps, past the form's maximum duration."
+          % MAX_STEPS, file=sys.stderr)
+    write_report()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(4)
 
 
 def install(fast: bool) -> bool:
@@ -87,7 +95,7 @@ def install(fast: bool) -> bool:
         else:
             REPORT["steps"] += 1
         if MAX_STEPS and REPORT["init_steps"] + REPORT["steps"] > MAX_STEPS:
-            raise TooLong()
+            stop_too_long()
         return original_step(self, *args, **kwargs)
 
     cls.__init__ = __init__
@@ -136,11 +144,6 @@ def main() -> int:
     sys.argv = [str(main_file)]
     try:
         runpy.run_path(str(main_file), run_name="__main__")
-    except TooLong:
-        REPORT["too_long"] = True
-        print("robotarium simulate: stopped after %d steps, past the form's maximum duration."
-              % MAX_STEPS, file=sys.stderr)
-        return 4
     except SystemExit as exit_:
         code = exit_.code
         if code is None or isinstance(code, int):

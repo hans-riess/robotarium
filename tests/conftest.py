@@ -58,6 +58,8 @@ class FakeRobotarium(BaseHTTPRequestHandler):
     drop = None
     #: A reply to give to the main-file PUT instead of success.
     mark_main_reply = {"message": "updated"}
+    #: A reply to give to experiment/create instead of success.
+    create_reply = {"experimentId": "exp-1", "status": "success", "message": "Experiment created"}
 
     def log_message(self, *arguments):
         pass
@@ -99,8 +101,7 @@ class FakeRobotarium(BaseHTTPRequestHandler):
         if self.path == "/api/files/upload":
             return self._reply({"file_id": "file-%s" % record["filename"]})
         if self.path == "/api/experiment/create":
-            return self._reply({"experimentId": "exp-1", "status": "success",
-                                "message": "Experiment created"})
+            return self._reply(type(self).create_reply)
         return self._reply({"message": "no such route"}, status=404)
 
     def do_GET(self):
@@ -140,6 +141,7 @@ def fresh_runtime():
     import robotarium_runtime
     robotarium_runtime._DECLARED.clear()
     robotarium_runtime._BACKENDS.clear()
+    robotarium_runtime._CLAIMED.clear()
     sys.modules.pop("robotarium_bundle", None)
     yield robotarium_runtime
     robotarium_runtime._DECLARED.clear()

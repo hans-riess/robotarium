@@ -184,6 +184,12 @@ def test_a_declared_but_unused_package_is_noted(tmp_path):
     ("c = ';'; using D", ["D"]),
     ('s = """\nusing NotReal; x\n"""\nusing E', ["E"]),
     ("#= outer #= inner =# using F =#\nusing G", ["G"]),
+    ('x = "$(f("a;b")) ; using X"\nusing Y', ["Y"]),
+    ('x = "$(g("#")) not a comment" ; using Z', ["Z"]),
+    ('"$(f("$(g("x;y"))"))"; using V', ["V"]),
+    ('s = "a \\" ; using Q"\nusing R', ["R"]),
+    ("c = '\"'; using D", ["D"]),
+    ('r = raw"a\\\\"; using H', ["H"]),
 ])
 def test_julia_statement_forms_are_parsed(source, expected):
     assert julia_packages_used(source) == expected
@@ -232,3 +238,36 @@ def test_a_version_guarded_import_is_optional(tmp_path):
     main = GOOD_MAIN + ("import sys\nif sys.version_info >= (3, 11):\n    import tomllib\n"
                         "else:\n    import tomli as tomllib\n")
     assert messages(findings_for(tmp_path, main), WARNING) == ""
+
+
+def test_includes_are_read_from_code_only(tmp_path):
+    from robotarium.preflight import julia_includes
+    source = ('# include("old.jl")\n"""\ninclude("doc.jl")\n"""\n#= include("x.jl") =#\n'
+              'include("ops.jl")\ninclude( "lib/util.jl" )\n')
+    assert julia_includes(source) == ["ops.jl", "lib/util.jl"]
+    found = findings_for(tmp_path, LOADER, files={"backend.jl": "# include(\"old.jl\")\n"})
+    assert messages(found, ERROR) == ""
+
+
+def test_the_julia_scanner_is_linear(tmp_path):
+    import time
+    from robotarium.preflight import julia_code
+    source = "x = 'a'; y = \"s\"\n" * 40000
+    started = time.time()
+    assert len(julia_code(source)) == len(source)
+    assert time.time() - started < 5
+
+
+@pytest.mark.parametrize("guarded, warned", [
+    ("if sys.version_info >= (3, 11):\n    import tomllib\nelse:\n    import pandas\n",
+     "pandas"),
+    ("if sys.version_info < (3, 11):\n    import tomllib\n", "tomllib"),
+    ("if sys.version_info[:2] >= (3, 11):\n    import tomllib\n", None),
+    ("if (3, 11) <= sys.version_info:\n    import tomllib\n", None),
+])
+def test_the_branch_the_testbed_takes_is_checked(tmp_path, guarded, warned):
+    found = messages(findings_for(tmp_path, GOOD_MAIN + "import sys\n" + guarded), WARNING)
+    if warned:
+        assert warned in found
+    else:
+        assert found == ""

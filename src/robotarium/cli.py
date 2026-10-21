@@ -20,8 +20,10 @@ manifest, from flags alone: --title, --description, --duration, --robots, --main
 
 import argparse
 import getpass
+import glob
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -294,7 +296,7 @@ def project_for_submit(arguments) -> Project:
     if arguments.main is not None:
         overrides["main"] = arguments.main.resolve()
     if arguments.files:
-        overrides["files"] = [path.resolve() for path in arguments.files]
+        overrides["files"] = [from_here(path) for path in arguments.files]
     if arguments.config is not None:
         overrides["config"] = arguments.config.resolve()
 
@@ -312,6 +314,17 @@ def project_for_submit(arguments) -> Project:
         setattr(experiment, key, value)
     experiment.__post_init__()
     return project
+
+
+def from_here(path: Path) -> Path:
+    """
+    A --file argument as an absolute path, read from the current directory as the shell would.
+    A glob keeps its pattern but not the directory's: `--file "data/*.npy"` run from exp[1]/
+    must not read exp[1] as a pattern.
+    """
+    if not path.is_absolute() and glob.has_magic(str(path)) and not path.is_file():
+        return Path(os.path.join(glob.escape(os.getcwd()), str(path)))
+    return path.resolve()
 
 
 def apply_simulator_arguments(project: Project, arguments) -> Project:

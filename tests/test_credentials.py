@@ -167,3 +167,31 @@ def test_a_password_that_is_not_text_is_refused_without_showing_it(monkeypatch):
     with pytest.raises(CredentialsError, match="not valid text") as error:
         resolve(interactive=False)
     assert "secret" not in str(error.value)
+
+
+
+def test_a_file_that_is_not_utf8_is_refused_by_name(tmp_path):
+    env = tmp_path / ".env"
+    env.write_bytes(b"ROBOTARIUM_USERNAME=someone@example.edu\nROBOTARIUM_PASSWORD=pa\xffss\n")
+    with pytest.raises(CredentialsError, match="not UTF-8 text") as error:
+        resolve(project_root=tmp_path, interactive=False)
+    assert "0xff" not in str(error.value) and "pa" not in str(error.value).split(".env")[-1]
+
+
+def test_storing_a_password_that_is_not_text_keeps_the_old_file():
+    credentials.store(USERNAME, PASSWORD, where="file")
+    path = credentials.user_credentials_file()
+    before = path.read_bytes()
+    with pytest.raises(CredentialsError, match="not valid text") as error:
+        credentials.store(USERNAME, "bad\udcffpass", where="file")
+    assert path.read_bytes() == before and "bad" not in str(error.value)
+
+
+def test_a_new_file_says_its_format_and_an_old_one_keeps_its_rules(tmp_path):
+    credentials.store(USERNAME, '"a"b', where="file")
+    path = credentials.user_credentials_file()
+    assert path.read_text().splitlines()[0] == credentials.USER_FILE_HEADER
+    assert resolve(interactive=False).password == '"a"b'
+    write(path, "# Written by `robotarium login`. Remove with `robotarium logout`.\n"
+                "ROBOTARIUM_USERNAME=%s\nROBOTARIUM_PASSWORD=\"a\"b\n" % USERNAME)
+    assert resolve(interactive=False).password == '"a"b'

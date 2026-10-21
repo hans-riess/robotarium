@@ -252,3 +252,20 @@ def test_an_unexpected_errors_text_stays_out_of_the_ledger(project, fake_site, l
         submit(project, confirm=False, out=lambda *_: None)
     entry = ledger.read(project.output_dir)[-1]
     assert entry["error"] == "UnicodeEncodeError" and "word" not in json.dumps(entry)
+
+
+
+def test_a_create_reply_without_an_id_is_uncertain(project, fake_site, logged_in, monkeypatch):
+    monkeypatch.setattr(FakeRobotarium, "create_reply", {"message": "ok"})
+    with pytest.raises(RobotariumError, match="may have been created") as error:
+        submit(project, confirm=False, out=lambda *_: None)
+    assert error.value.uncertain
+    assert ledger.read(project.output_dir)[-1]["orphaned_uploads"] == 0
+
+
+def test_an_explicit_refusal_at_create_leaves_orphaned_uploads(project, fake_site, logged_in,
+                                                              monkeypatch):
+    monkeypatch.setattr(FakeRobotarium, "create_reply", {"status": "error", "message": "no"})
+    with pytest.raises(RobotariumError, match="attached to no experiment"):
+        submit(project, confirm=False, out=lambda *_: None)
+    assert ledger.read(project.output_dir)[-1]["orphaned_uploads"] == 4

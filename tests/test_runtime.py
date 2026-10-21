@@ -200,3 +200,36 @@ def test_a_failed_write_leaves_no_partial_file(tmp_path, fresh_runtime, monkeypa
     with pytest.raises(OSError):
         log.save()
     assert list(tmp_path.iterdir()) == []
+
+
+
+@pytest.mark.parametrize("value", [
+    np.zeros(2, dtype=[("a", float), ("b", object)]),
+    np.array([None, 1], dtype=object),
+])
+def test_anything_holding_objects_is_refused(tmp_path, fresh_runtime, value):
+    log = fresh_runtime.RunLogger(directory=tmp_path, save_at_exit=False)
+    with pytest.raises(ValueError, match="not numbers or text"):
+        log.record(x=value)
+
+
+@pytest.mark.parametrize("name", ["file", "allow_pickle", "__meta__", "__steps__x"])
+def test_reserved_names_are_refused(tmp_path, fresh_runtime, name):
+    log = fresh_runtime.RunLogger(directory=tmp_path, save_at_exit=False)
+    with pytest.raises(ValueError, match="reserves"):
+        log.record(**{name: 1.0})
+
+
+def test_a_series_must_keep_a_type_it_can_be_stacked_in(tmp_path, fresh_runtime):
+    log = fresh_runtime.RunLogger(directory=tmp_path, save_at_exit=False)
+    log.record(when=np.datetime64("2026-10-21T15:00"))
+    with pytest.raises(ValueError, match="cannot be kept as one array"):
+        log.record(when=1.5)
+    log.record(when=np.datetime64("2026-10-21T15:00:01"))
+    assert fresh_runtime.load_run(log.save()).data["when"].shape == (2,)
+
+
+def test_two_loggers_of_one_name_write_two_files(tmp_path, fresh_runtime):
+    first = fresh_runtime.RunLogger("same", directory=tmp_path, save_at_exit=False)
+    second = fresh_runtime.RunLogger("same", directory=tmp_path, save_at_exit=False)
+    assert first.path != second.path

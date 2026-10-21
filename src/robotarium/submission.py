@@ -24,8 +24,8 @@ from pathlib import Path
 from . import credentials as credentials_module
 from . import ledger, libraries, preflight, simulate
 from .bundle import Bundle, build
-from .client import (DASHBOARD_URL, ConnectionLost, RobotariumClient, RobotariumError,
-                     check_against_settings, experiment_form)
+from .client import (DASHBOARD_URL, RobotariumClient, RobotariumError, check_against_settings,
+                     experiment_form)
 from .experiment import Experiment, Project
 from .findings import ERROR, WARNING, Finding, errors, ordered
 from .limits import EXPERIMENT_TYPE
@@ -282,11 +282,11 @@ def _consequence(stage: str, error: BaseException, uploaded: list, experiment_id
     What a failure at `stage` leaves behind on the site: a kind ("orphaned", "unknown",
     "unmarked" or None) and a sentence for the person ("" for nothing).
 
-    An answer that never came (ConnectionLost), a gateway's 5xx, or anything else that stopped
-    the request part-way means the site may have acted on it, so those are "unknown".
+    An answer that never came (ConnectionLost), a gateway's 5xx, a success that does not name
+    what it made, or anything else that stopped the request part-way means the site may have
+    acted on it, so those are "unknown".
     """
-    unanswered = isinstance(error, ConnectionLost) or not isinstance(error, RobotariumError) \
-        or (getattr(error, "status", None) or 0) >= 500
+    unanswered = not isinstance(error, RobotariumError) or error.uncertain
     if stage == "mark-main":
         if unanswered:
             return "unknown", ("Experiment %s was created; whether its main file got marked is "

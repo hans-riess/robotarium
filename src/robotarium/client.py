@@ -59,11 +59,14 @@ class RobotariumError(RuntimeError):
     Args:
         message (str): What happened.
         status (int): The HTTP status the site answered with, when it answered with one.
+        uncertain (bool): Whether the site may have done what was asked anyway -- an answer
+            lost, a gateway's 5xx, a success that does not say what it made.
     """
 
-    def __init__(self, message: str, status: int = None):
+    def __init__(self, message: str, status: int = None, uncertain: bool = None):
         super().__init__(message)
         self.status = status
+        self.uncertain = bool(uncertain) if uncertain is not None else (status or 0) >= 500
 
 
 class ConnectionLost(RobotariumError):
@@ -71,6 +74,9 @@ class ConnectionLost(RobotariumError):
     A request was sent and no answer came back: the connection dropped or timed out. Unlike a
     refusal, the site may have acted on it -- an experiment may exist although create failed.
     """
+
+    def __init__(self, message: str):
+        super().__init__(message, uncertain=True)
 
 
 def api_url() -> str:
@@ -140,9 +146,12 @@ class RobotariumClient:
             form (dict): What experiment_form returns.
         """
         reply = self._request("POST", "experiment/create", body=form)
-        if reply.get("status") == "error" or not reply.get("experimentId"):
-            raise RobotariumError("Experiment refused: %s"
-                                  % _reason(reply, "no experimentId in the reply"))
+        if reply.get("status") == "error":
+            raise RobotariumError("Experiment refused: %s" % _reason(reply, "no reason"))
+        if not reply.get("experimentId"):
+            # Answered, without an error and without an id: whether it made one is unknown.
+            raise RobotariumError("The site answered without an experiment id: %s"
+                                  % _reason(reply, "no message"), uncertain=True)
         return reply["experimentId"]
 
     def mark_main_file(self, main_file_id: str, file_ids: list, experiment_id: str) -> None:

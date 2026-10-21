@@ -99,14 +99,15 @@ class SimulationReport:
         if self.timed_out:
             add(Finding(ERROR, "The run was stopped at the timeout, after %s."
                                % ("%d steps" % self.total_steps if self.rps
-                                  else "an unknown number of steps (it did not stop on Ctrl-C, "
-                                       "so it was killed before it could report)")))
+                                  else "an unknown number of steps (it was stopped before it "
+                                       "could report)")))
             if self.rps is None:
                 return findings
         elif self.too_long:
             add(Finding(ERROR, "The run was stopped after %d steps, about %.0f s on the testbed: "
-                               "longer than the form's %d s maximum. A drive to initial poses "
-                               "the robots cannot reach also never ends."
+                               "longer than the form's %d s maximum, so it cannot be submitted "
+                               "as it is. (A drive to initial poses the robots cannot reach "
+                               "never ends either.)"
                                % (self.total_steps, self.testbed_seconds,
                                   limits.MAX_DURATION_SECONDS)))
         if self.rps is None:
@@ -154,7 +155,8 @@ class SimulationReport:
         if self.skipped_initialization:
             add(Finding(INFO, "skip_initialization=True was overridden: the robots were driven "
                               "to their initial poses first, as on the testbed."))
-        if self.total_steps:
+        # A run cut short says nothing about how long the whole one takes.
+        if self.total_steps and not (self.timed_out or self.too_long):
             add(Finding(INFO, "%d steps (%d driving to the initial poses): about %.0f s on the "
                               "testbed. Suggested estimated duration: %d s."
                               % (self.total_steps, self.init_steps, self.testbed_seconds,
@@ -230,11 +232,11 @@ def run(bundle, simulator=None, fast: bool = True, headless: bool = True, timeou
         command = [python or sys.executable, "-m", "robotarium._simshim", str(bundle.main)]
         log.debug("running %s in %s", " ".join(command), bundle.directory)
 
-        # Its own process group on POSIX, so a timeout or Ctrl-C reaches anything the main file
-        # started too.
+        # Output a console cannot show is replaced, never fatal: a reader that died would leave
+        # the run blocked on a full pipe.
         process = subprocess.Popen(command, cwd=bundle.directory, env=environment,
-                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                                   bufsize=1, start_new_session=os.name == "posix")
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   encoding="utf-8", errors="replace", bufsize=1)
         tail = collections.deque(maxlen=60)
         reader = threading.Thread(target=_relay, args=(process.stdout, tail, echo), daemon=True)
         reader.start()
@@ -246,22 +248,26 @@ def run(bundle, simulator=None, fast: bool = True, headless: bool = True, timeou
                 if process.poll() is not None:
                     return  # it finished in time, whatever is still being printed
                 stopped.set()
-                _signal(process, signal.SIGINT)  # so the shim still writes its report
-                killer = threading.Timer(10.0, _signal, (process, signal.SIGKILL))
+                _interrupt(process)  # so the shim still writes its report
+                killer = threading.Timer(10.0, _kill, (process,))
                 killer.daemon = True
                 killer.start()
             timer = threading.Timer(float(timeout), stop)
             timer.start()
+        restore = _stop_with_this_process()
         try:
             returncode = process.wait()
         finally:
+            restore()
             if timer is not None:
                 timer.cancel()
             if process.poll() is None:
-                _signal(process, signal.SIGKILL)
+                _kill(process)
                 process.wait()
-        # The rest of the output, unless something the main file started still holds the pipe.
-        reader.join(timeout=5)
+        # The rest of the output, however slow the console; but a process the main file
+        # started and left holding the pipe does not keep this waiting past the 30 s (5 s once
+        # the run has already been stopped for its timeout).
+        reader.join(timeout=5 if stopped.is_set() else 30)
 
         data = {}
         if report_path.is_file():
@@ -275,22 +281,64 @@ def run(bundle, simulator=None, fast: bool = True, headless: bool = True, timeou
 
 
 def _relay(stream, tail, echo: bool) -> None:
-    """Copies the run's output to the console as it comes, keeping the last lines."""
+    """
+    Copies the run's output to the console as it comes, keeping the last lines. It reads to
+    the end whatever the console does, since the run blocks once the pipe is full.
+    """
     for line in stream:
         tail.append(line)
         if echo:
-            sys.stdout.write(line)
-            sys.stdout.flush()
+            try:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+            except (OSError, ValueError, UnicodeError):
+                echo = False
 
 
-def _signal(process, number) -> None:
-    """Sends a signal to the run and everything it started; on Windows, terminates it."""
+def _interrupt(process) -> None:
+    """Ctrl-C, where there is such a thing; elsewhere, terminate."""
     if process.poll() is not None:
         return
     try:
         if os.name == "posix":
-            os.killpg(process.pid, number)
+            process.send_signal(signal.SIGINT)
         else:
             process.terminate()
     except OSError:
         pass
+
+
+def _kill(process) -> None:
+    if process.poll() is None:
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+
+def _stop_with_this_process():
+    """
+    Makes a SIGTERM or SIGHUP to this process -- a closed terminal, `timeout`, a CI runner
+    cancelling the job -- end the run too, instead of leaving it running unattended; returns a
+    function that puts the previous handlers back. Only the main thread can install handlers;
+    elsewhere this does nothing.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return lambda: None
+    previous = {}
+
+    def leave(number, frame):
+        raise SystemExit(128 + number)
+
+    for name in ("SIGTERM", "SIGHUP"):
+        number = getattr(signal, name, None)
+        if number is not None:
+            try:
+                previous[number] = signal.signal(number, leave)
+            except (OSError, ValueError):
+                pass
+
+    def restore():
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+    return restore

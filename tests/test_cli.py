@@ -104,3 +104,19 @@ def test_simulate_then_inspect_the_run_log(project_dir, capsys):
     assert cli.main(["inspect", str(run)]) == 0
     out = capsys.readouterr().out
     assert "poses                150x3x4" in out and "finished 150 steps" in out
+
+
+
+def test_a_file_glob_on_the_command_line_is_read_from_here(tmp_path, fake_site, logged_in,
+                                                         monkeypatch):
+    here = tmp_path / "work[1]"
+    write(here / "go.py", "import rps.robotarium as robotarium\n"
+                          "r = robotarium.Robotarium(number_of_robots=2)\nr.debug()\n")
+    write(here / "data" / "a.npy", "")
+    write(here / "data" / "b.npy", "")
+    monkeypatch.chdir(here)
+    code = cli.main(["submit", "--title", "G", "--description", "D", "--duration", "60",
+                     "--robots", "2", "--main", "go.py", "--file", "data/*.npy", "--yes"])
+    assert code == 0
+    uploads = [each["filename"] for each in fake_site if each["path"] == "/api/files/upload"]
+    assert uploads == ["go.py", "a.npy", "b.npy"]

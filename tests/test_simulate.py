@@ -1,5 +1,8 @@
 """Rehearsing in the Robotarium simulator: what the report says and what it is judged by."""
 
+import os
+import sys
+
 import pytest
 
 from robotarium import simulate
@@ -267,3 +270,94 @@ r.call_at_scripts_end()
     report = simulate.run(bundle, simulator=tmp_path / "oldsim", echo=False, timeout=60)
     assert report.returncode == 0, report.output
     assert report.robots == [2] and report.steps == 1 and report.ended
+
+
+
+def test_a_cut_short_run_gets_no_duration_advice():
+    for report in (SimulationReport(returncode=4, rps="/rps", robots=[4], steps=18183,
+                                    too_long=True, ended=False),
+                   SimulationReport(returncode=-2, rps="/rps", robots=[4], steps=900,
+                                    timed_out=True)):
+        found = report.findings(experiment(duration=60))
+        text = " ".join(each.message for each in found)
+        assert "Suggested estimated duration" not in text and "Declare" not in text
+
+
+@needs_simulator
+def test_a_bare_except_cannot_keep_a_run_past_the_cap(tmp_path):
+    experiment, bundle = _bundle_of(tmp_path, """\
+import rps.robotarium as robotarium
+r = robotarium.Robotarium(number_of_robots=2)
+while True:
+    try:
+        r.get_poses()
+        r.step()
+    except:
+        pass
+""")
+    report = simulate.run(bundle, echo=False, timeout=300)
+    assert report.too_long and not report.timed_out
+
+
+@needs_simulator
+def test_output_that_is_not_text_cannot_hang_the_run(tmp_path):
+    experiment, bundle = _bundle_of(tmp_path, """\
+import sys
+for _ in range(2000):
+    sys.stdout.buffer.write(b"\\xff\\xfe not utf-8 " * 10 + b"\\n")
+sys.stdout.flush()
+print("done")
+""")
+    report = simulate.run(bundle, echo=False, timeout=120)
+    assert report.returncode == 0 and not report.timed_out and "done" in report.output
+
+
+@needs_simulator
+def test_a_run_that_ends_while_its_output_is_drained_is_not_timed_out(tmp_path, monkeypatch):
+    import time
+    experiment, bundle = _bundle_of(tmp_path, """\
+for index in range(2000):
+    print("line %d" % index)
+""")
+    real_write = sys.stdout.write
+
+    def slow(text):
+        time.sleep(0.002)
+        return real_write("")
+
+    monkeypatch.setattr(sys.stdout, "write", slow)
+    report = simulate.run(bundle, echo=True, timeout=1.5)
+    assert report.returncode == 0 and not report.timed_out
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX signals")
+@needs_simulator
+def test_terminating_robotarium_ends_the_run_too(tmp_path):
+    import signal
+    import subprocess
+    import time
+    pid_file = tmp_path / "child.pid"
+    experiment, bundle = _bundle_of(tmp_path / "exp", """\
+import os, time
+open(%r, "w").write(str(os.getpid()))
+time.sleep(120)
+""" % str(pid_file))
+    parent = subprocess.Popen([sys.executable, "-c", (
+        "import sys; from pathlib import Path; from robotarium import simulate\n"
+        "from robotarium.bundle import Bundle\n"
+        "b = Bundle(directory=Path(%r), files=[Path(%r)], title='t', description='d',"
+        " duration=60, robots=2, built_at='x')\n"
+        "simulate.run(b, echo=False)\n") % (str(bundle.directory), str(bundle.main))])
+    deadline = time.time() + 60
+    while not pid_file.exists() and time.time() < deadline:
+        time.sleep(0.1)
+    child = int(pid_file.read_text())
+    parent.send_signal(signal.SIGTERM)
+    parent.wait(timeout=30)
+    time.sleep(0.5)
+    try:
+        os.kill(child, 0)
+        alive = True
+    except ProcessLookupError:
+        alive = False
+    assert not alive, "the run outlived a terminated robotarium"

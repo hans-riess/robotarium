@@ -313,6 +313,13 @@ def _package_entry(package) -> tuple:
 # logging a run
 # ---------------------------------------------------------------------------
 
+#: Names np.savez_compressed takes as its own parameters, so a series cannot have them.
+_RESERVED = ("file", "allow_pickle")
+
+#: The paths RunLoggers in this process write to.
+_CLAIMED = set()
+
+
 class RunLogger:
     """
     Records a run step by step and writes it as one .npz file: an array per recorded quantity,
@@ -342,8 +349,15 @@ class RunLogger:
     def __init__(self, name="run", directory=None, meta=None, autosave_every=0,
                  save_at_exit=True, echo=True):
         self.started = datetime.datetime.now().astimezone()
-        directory = directory or os.environ.get(LOG_DIR_VARIABLE) or here()
-        self.path = Path(directory) / ("%s_%s.npz" % (name, self.started.strftime("%Y%m%d_%H%M%S")))
+        directory = Path(directory or os.environ.get(LOG_DIR_VARIABLE) or here())
+        stem = "%s_%s" % (name, self.started.strftime("%Y%m%d_%H%M%S"))
+        self.path = directory / ("%s.npz" % stem)
+        # Two loggers of one name started within a second must not write the same file.
+        number = 1
+        while self.path.resolve() in _CLAIMED or self.path.exists():
+            number += 1
+            self.path = directory / ("%s_%d.npz" % (stem, number))
+        _CLAIMED.add(self.path.resolve())
         self.autosave_every = int(autosave_every)
         self.echo = echo
         self._series = {}
@@ -374,15 +388,26 @@ class RunLogger:
         # Every value is checked before any is kept, so a refused record leaves no series a
         # step longer than the others.
         for key, array in arrays.items():
-            if array.dtype == object:
-                raise ValueError("RunLogger: %r is not numbers or text (it would need pickling, "
-                                 "and the file must load without it). Record numbers, arrays "
+            if key in _RESERVED or key.startswith("__"):
+                raise ValueError("RunLogger: %r is a name the file format reserves; record it "
+                                 "under another." % key)
+            # Objects in any form -- object arrays, structured dtypes with an object field,
+            # numpy 2's StringDType -- need pickling, and the file must load without it.
+            if array.dtype.hasobject or array.dtype.kind == "T":
+                raise ValueError("RunLogger: %r is not numbers or text. Record numbers, arrays "
                                  "or strings; put anything else in meta." % key)
             series = self._series.get(key)
             if series and series[0].shape != array.shape:
                 raise ValueError("RunLogger: %r was recorded with shape %s and now %s. Record "
                                  "a quantity with the same shape at every step."
                                  % (key, series[0].shape, array.shape))
+            if series:
+                try:
+                    np.result_type(series[0].dtype, array.dtype)
+                except TypeError:
+                    raise ValueError("RunLogger: %r was recorded as %s and now as %s, which "
+                                     "cannot be kept as one array." % (
+                                         key, series[0].dtype, array.dtype)) from None
         for key, array in arrays.items():
             self._series.setdefault(key, []).append(array)
             self._steps.setdefault(key, []).append(step)
