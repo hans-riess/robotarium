@@ -114,8 +114,14 @@ class RobotariumClient:
             password (str): The password in the clear; it leaves here encrypted, as the page
                 sends it.
         """
+        try:
+            encrypted = encrypt_password(password)
+        except UnicodeEncodeError:
+            # The error would quote the character; the message names the problem only.
+            raise RobotariumError("The password is not valid text (it holds bytes that are not "
+                                  "UTF-8).") from None
         reply = self._request("POST", "auth/login",
-                              body={"email": email, "password": encrypt_password(password)})
+                              body={"email": email, "password": encrypted})
         if not reply.get("token"):
             raise RobotariumError("Login refused: %s" % _reason(reply, "no token in the reply"))
         self.token = reply["token"]

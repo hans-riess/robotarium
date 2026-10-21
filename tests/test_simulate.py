@@ -363,3 +363,49 @@ time.sleep(120)
     except ProcessLookupError:
         alive = False
     assert not alive, "the run outlived a terminated robotarium"
+
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX signals")
+def test_nohup_and_custom_handlers_are_left_alone():
+    import signal
+    previous = signal.getsignal(signal.SIGHUP)
+    try:
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)       # as `nohup` leaves it
+        restore = simulate._stop_with_this_process()
+        assert signal.getsignal(signal.SIGHUP) is signal.SIG_IGN
+        restore()
+
+        signal.signal(signal.SIGHUP, signal.SIG_DFL)
+        restore = simulate._stop_with_this_process()
+        assert signal.getsignal(signal.SIGHUP) not in (signal.SIG_DFL, signal.SIG_IGN)
+        restore()
+        assert signal.getsignal(signal.SIGHUP) is signal.SIG_DFL
+    finally:
+        signal.signal(signal.SIGHUP, previous)
+
+
+@needs_simulator
+def test_the_step_cap_still_saves_the_run_log(tmp_path):
+    experiment, bundle = _bundle_of(tmp_path, """\
+import rps.robotarium as robotarium
+from robotarium_runtime import RunLogger
+log = RunLogger("capped")
+r = robotarium.Robotarium(number_of_robots=2)
+while True:
+    x = r.get_poses()
+    log.record(poses=x)
+    r.step()
+""")
+    report = simulate.run(bundle, echo=False, timeout=300, log_dir=tmp_path / "runs")
+    assert report.too_long
+    saved = list((tmp_path / "runs").glob("capped_*.npz"))
+    assert len(saved) == 1 and not list((tmp_path / "runs").glob("*.partial"))
+
+
+@needs_simulator
+def test_the_run_writes_utf8_whatever_the_console(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYTHONIOENCODING", "latin-1")    # a console that cannot show a check
+    experiment, bundle = _bundle_of(tmp_path, 'print("café ✓ θ")\n')
+    report = simulate.run(bundle, echo=False, timeout=60)
+    assert report.returncode == 0 and "café ✓ θ" in report.output

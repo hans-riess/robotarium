@@ -271,3 +271,18 @@ def test_the_branch_the_testbed_takes_is_checked(tmp_path, guarded, warned):
         assert warned in found
     else:
         assert found == ""
+
+
+
+@pytest.mark.parametrize("include", ['"./ops.jl"', '"$(@__DIR__)/ops.jl"', '"$(name).jl"',
+                                     '".\\\\ops.jl"'])
+def test_include_paths_that_name_the_file_beside_are_accepted(tmp_path, include):
+    found = findings_for(tmp_path, LOADER, files={"backend.jl": "include(%s)\n" % include,
+                                                  "ops.jl": ""})
+    assert messages(found, ERROR) == ""
+
+
+def test_an_include_from_a_subdirectory_is_still_an_error(tmp_path):
+    found = findings_for(tmp_path, LOADER, files={"backend.jl": 'include("./lib/ops.jl")\n',
+                                                  "ops.jl": ""})
+    assert "include it by base name" in messages(found, ERROR)

@@ -48,17 +48,22 @@ MAX_STEPS = int(os.environ.get("ROBOTARIUM_SIM_MAX_STEPS") or 0)
 
 def stop_too_long() -> None:
     """
-    Ends the run past MAX_STEPS, report written first. Not by raising: an exception from
-    step() can be caught by the main file -- a bare `except:` would catch even a
-    BaseException -- and a loop around it would then spin for ever.
+    Ends the run past MAX_STEPS, its exit handlers and the report run first. Not by raising:
+    an exception from step() can be caught by the main file -- a bare `except:` would catch
+    even a BaseException -- and a loop around it would then spin for ever.
     """
     REPORT["too_long"] = True
     print("robotarium simulate: stopped after %d steps, past the form's maximum duration."
           % MAX_STEPS, file=sys.stderr)
-    write_report()
-    sys.stdout.flush()
-    sys.stderr.flush()
-    os._exit(4)
+    # What exiting would have run: a RunLogger's last save, the main file's own handlers, and
+    # this report (registered first, so run last).
+    try:
+        atexit._run_exitfuncs()
+    finally:
+        write_report()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(4)
 
 
 def install(fast: bool) -> bool:

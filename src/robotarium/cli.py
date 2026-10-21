@@ -386,6 +386,7 @@ def run_login(arguments) -> int:
     if not username or not password:
         print("Nothing stored.")
         return 1
+    credentials_module.check_text(email=username, password=password)
     if arguments.verify:
         RobotariumClient().login(username, password)
         print("Logged in: the credentials work.")

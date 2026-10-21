@@ -52,3 +52,10 @@ def test_a_refused_login_gives_the_sites_reason_and_not_the_password(fake_site):
 def test_an_unreachable_site_is_named(monkeypatch):
     with pytest.raises(RobotariumError, match="Could not reach"):
         RobotariumClient("http://127.0.0.1:9/api/").settings()
+
+
+
+def test_a_password_that_is_not_text_is_refused_without_quoting_it(fake_site):
+    with pytest.raises(RobotariumError, match="not valid text") as error:
+        RobotariumClient().login(USERNAME, "zqj\udcffxvk")
+    assert "zqj" not in str(error.value) and "xvk" not in str(error.value) and fake_site == []

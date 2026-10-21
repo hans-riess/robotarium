@@ -131,3 +131,13 @@ def test_flags_alone_default_to_the_maximum_duration(tmp_path, fake_site, logged
     assert code == 0
     create = next(each["json"] for each in fake_site if each["path"].endswith("create"))
     assert create["estimatedDuration"] == "600"
+
+
+
+def test_login_refuses_a_password_that_is_not_text_without_showing_it(tmp_path, capsys,
+                                                                      monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda prompt: "someone@example.edu")
+    monkeypatch.setattr("getpass.getpass", lambda prompt: "zqj\udcffxvk")
+    assert cli.main(["login", "--store", "file", "--verify"]) == 1
+    err = capsys.readouterr().err
+    assert "not valid text" in err and "zqj" not in err and "xvk" not in err

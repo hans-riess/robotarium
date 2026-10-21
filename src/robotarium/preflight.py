@@ -522,6 +522,14 @@ def _check_julia(julia_files: list, names: set, trees: dict, experiment) -> list
                 "packages in robotarium.toml (`robotarium julia lookup %s` prints the entry)."
                 % (path.name, package, package), file=path.name))
         for included in julia_includes(source):
+            # "./x.jl" and "$(@__DIR__)/x.jl" both name the file beside this one; any other
+            # interpolation cannot be resolved here, so it is left to the run.
+            included = included.replace("\\\\", "\\")  # the string's own \\ is one backslash
+            included = re.sub(r"^(?:\$\(@__DIR__\)|\$@__DIR__)[/\\]", "", included)
+            while included.startswith(("./", ".\\")):
+                included = included[2:]
+            if "$" in included:
+                continue
             if Path(included).name not in names:
                 findings.append(Finding(ERROR, "include(%r), but %s is not uploaded."
                                                % (included, Path(included).name),

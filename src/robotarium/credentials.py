@@ -255,13 +255,13 @@ def resolve(project_root: Path = None, env_file: Path = None, use_keyring: bool 
             "No %s found. Set %s in the environment or in a .env file beside robotarium.toml, "
             "or run `robotarium login` to keep them in the system keyring. docs/credentials.md "
             "has the details." % (" or ".join(missing), " and ".join(missing)))
-    _check_text(**{"%s from %s" % (USERNAME_VARIABLE, username_source): username,
-                   "%s from %s" % (PASSWORD_VARIABLE, password_source): password})
+    check_text(**{"%s from %s" % (USERNAME_VARIABLE, username_source): username,
+                  "%s from %s" % (PASSWORD_VARIABLE, password_source): password})
 
     return Credentials(username, password, username_source, password_source, tuple(warnings))
 
 
-def _check_text(**values) -> None:
+def check_text(**values) -> None:
     """
     Refuses a value that is not valid text -- bytes that are not UTF-8, from a mis-encoded
     environment, file or terminal -- by name only: the value, and the character, stay out of
@@ -340,7 +340,7 @@ def store(username: str, password: str, where: str = "keyring") -> str:
         where (str): "keyring" or "file".
     """
     path = user_credentials_file()
-    _check_text(username=username, password=password)
+    check_text(username=username, password=password)
     values = read_user_file(path) if path.is_file() else {}
     values[USERNAME_VARIABLE] = username
 

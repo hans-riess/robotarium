@@ -218,6 +218,9 @@ def run(bundle, simulator=None, fast: bool = True, headless: bool = True, timeou
     if headless:
         environment["MPLBACKEND"] = "Agg"
     environment["ROBOTARIUM_SIM_FAST"] = "1" if fast else "0"
+    # The reader decodes UTF-8, so the run writes it, whatever the console's own encoding
+    # (cp1252 on Windows).
+    environment["PYTHONIOENCODING"] = "utf-8"
     if log_dir:
         Path(log_dir).mkdir(parents=True, exist_ok=True)
         environment["ROBOTARIUM_LOG_DIR"] = str(Path(log_dir).resolve())
@@ -333,11 +336,14 @@ def _stop_with_this_process():
 
     for name in ("SIGTERM", "SIGHUP"):
         number = getattr(signal, name, None)
-        if number is not None:
-            try:
-                previous[number] = signal.signal(number, leave)
-            except (OSError, ValueError):
-                pass
+        # Only the default (die) is replaced: `nohup` sets SIGHUP to ignored, and a program
+        # embedding this package may have its own handler, and both are kept as they are.
+        if number is None or signal.getsignal(number) is not signal.SIG_DFL:
+            continue
+        try:
+            previous[number] = signal.signal(number, leave)
+        except (OSError, ValueError):
+            pass
 
     def restore():
         for number, handler in previous.items():
