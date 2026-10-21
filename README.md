@@ -32,7 +32,9 @@ rather than at the end of the testbed's queue.
 
 ## Install
 
-Python 3.11 or newer, in a virtual environment. Recent Linux distributions (Ubuntu 23.04+,
+Linux or macOS, both tested in CI; Windows is not supported yet
+([#2](https://github.com/hans-riess/robotarium/issues/2)). Python 3.11 or newer, in a virtual
+environment. Recent Linux distributions (Ubuntu 23.04+,
 Debian 12+) refuse `pip install` into the system Python with `externally-managed-environment`,
 and a venv is the right fix:
 

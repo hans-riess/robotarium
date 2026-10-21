@@ -12,16 +12,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # pyproject requires >= 3.11 (tomllib). Every version on Linux; one on macOS and
-        # Windows, which is where the keyring backends, paths and process handling differ.
-        # The runtime module that travels to the testbed is kept 3.10-compatible separately;
-        # see the job below.
+        # pyproject requires >= 3.11 (tomllib). Every version on Linux; one on macOS, where the
+        # keyring backend and process handling differ. Windows is not supported yet:
+        # hans-riess/robotarium#2 says what its first run found and how to add it back. The
+        # runtime module that travels to the testbed is kept 3.10-compatible separately; see
+        # the job below.
         os: [ubuntu-latest]
         python-version: ["3.11", "3.12", "3.13"]
         include:
           - os: macos-latest
-            python-version: "3.12"
-          - os: windows-latest
             python-version: "3.12"
 
     defaults:
