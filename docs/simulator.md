@@ -68,7 +68,8 @@ running.
 
 The wall clock is also compared with the declared duration. A run longer than its estimated
 duration is an error, because the testbed stops it, and the message suggests a duration with
-headroom. `duration = "auto"` uses that suggestion.
+headroom. `duration = "measured"` uses that suggestion; the default, `"auto"`, declares the
+form's maximum, 600 s.
 
 `robotarium simulate` exits non-zero on any error, so it can gate CI. `robotarium submit
 --simulate`, or `[submit] simulate = true`, runs it before every submission and refuses to send

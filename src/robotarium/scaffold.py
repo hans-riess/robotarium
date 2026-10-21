@@ -19,7 +19,7 @@ title = "__TITLE__ ({timestamp})"   # {date} {time} {timestamp} {git} {robots} {
 description = """
 __DESCRIPTION__
 """
-duration = "auto"   # seconds, "90s", "2m" -- or "auto": measured by a simulator run
+duration = "auto"   # the form's maximum, 600 s; or seconds, "90s", "2m"; or "measured"
 robots = __ROBOTS__
 main = "main.py"
 files = [__FILES__]   # supporting files, uploaded flat beside main.py; globs work

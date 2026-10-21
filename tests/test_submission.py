@@ -148,8 +148,8 @@ def test_the_sites_live_limits_refuse_before_uploading(project, fake_site, logge
     assert "/api/files/upload" not in [each["path"] for each in fake_site]
 
 
-def test_auto_without_a_simulation_is_refused(project, fake_site, logged_in):
-    project.experiment.duration = "auto"
+def test_measured_without_a_simulation_is_refused(project, fake_site, logged_in):
+    project.experiment.duration = "measured"
     with pytest.raises(SubmissionRefused, match="only a simulation"):
         submit(project, simulate_first=False, confirm=False, out=lambda *_: None)
 
@@ -269,3 +269,20 @@ def test_an_explicit_refusal_at_create_leaves_orphaned_uploads(project, fake_sit
     with pytest.raises(RobotariumError, match="attached to no experiment"):
         submit(project, confirm=False, out=lambda *_: None)
     assert ledger.read(project.output_dir)[-1]["orphaned_uploads"] == 4
+
+
+
+def test_auto_declares_the_maximum_and_follows_a_lower_live_one(project, fake_site, logged_in,
+                                                                monkeypatch):
+    project.experiment.duration = "auto"
+    result = submit(project, confirm=False, out=lambda *_: None)
+    create = next(each["json"] for each in fake_site if each["path"].endswith("create"))
+    assert create["estimatedDuration"] == "600" and result.prepared.report is None
+
+    fake_site.clear()
+    monkeypatch.setattr(FakeRobotarium, "settings", {**FakeRobotarium.settings,
+                                                     "maxDuration": 300})
+    submit(project, confirm=False, out=lambda *_: None)
+    create = next(each["json"] for each in fake_site if each["path"].endswith("create"))
+    assert create["estimatedDuration"] == "300"
+    assert ledger.read(project.output_dir)[-1]["duration"] == 300

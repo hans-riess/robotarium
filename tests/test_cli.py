@@ -120,3 +120,14 @@ def test_a_file_glob_on_the_command_line_is_read_from_here(tmp_path, fake_site, 
     assert code == 0
     uploads = [each["filename"] for each in fake_site if each["path"] == "/api/files/upload"]
     assert uploads == ["go.py", "a.npy", "b.npy"]
+
+
+
+def test_flags_alone_default_to_the_maximum_duration(tmp_path, fake_site, logged_in):
+    write(tmp_path / "go.py", "import rps.robotarium as robotarium\n"
+                              "r = robotarium.Robotarium(number_of_robots=2)\nr.debug()\n")
+    code = cli.main(["submit", "--title", "T", "--description", "D", "--robots", "2",
+                     "--main", str(tmp_path / "go.py"), "--yes"])
+    assert code == 0
+    create = next(each["json"] for each in fake_site if each["path"].endswith("create"))
+    assert create["estimatedDuration"] == "600"

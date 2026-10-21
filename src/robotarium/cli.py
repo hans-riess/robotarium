@@ -110,7 +110,9 @@ def build_parser() -> argparse.ArgumentParser:
     group.add_argument("--title")
     group.add_argument("--description")
     group.add_argument("--description-file", type=Path, metavar="FILE")
-    group.add_argument("--duration", help="seconds, \"90s\", \"2m\", or \"auto\"")
+    group.add_argument("--duration", help="seconds, \"90s\", \"2m\"; \"auto\" (the form's "
+                                          "maximum, 600 s; the default) or \"measured\" (from a "
+                                          "simulator run)")
     group.add_argument("--robots", type=int)
     group.add_argument("--main", type=Path, metavar="FILE")
     group.add_argument("--file", type=Path, action="append", default=[], dest="files",
@@ -314,10 +316,11 @@ def project_for_submit(arguments) -> Project:
 
     if find_manifest(arguments.project) is None and "main" in overrides:
         missing = [flag for flag, key in (("--title", "title"), ("--description", "description"),
-                                          ("--duration", "duration"), ("--robots", "robots"))
+                                          ("--robots", "robots"))
                    if key not in overrides]
         if missing:
             raise ValueError("Without a robotarium.toml, submit needs %s." % ", ".join(missing))
+        overrides.setdefault("duration", "auto")
         return Project(experiment=Experiment(root=Path.cwd(), **overrides))
 
     project = load_project(arguments.project)

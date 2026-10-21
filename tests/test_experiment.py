@@ -13,6 +13,7 @@ from conftest import write
 @pytest.mark.parametrize("given, seconds", [
     (90, 90), (89.2, 90), ("90", 90), ("90s", 90), ("2m", 120), ("1m30s", 90),
     ("1.5 min", 90), ("2 minutes", 120), ("45 sec", 45), ("auto", "auto"), ("AUTO", "auto"),
+    ("measured", "measured"),
 ])
 def test_durations_are_read_as_whole_seconds(given, seconds):
     assert parse_duration(given) == seconds
@@ -179,7 +180,7 @@ def test_a_misspelt_key_fails_loudly(tmp_path):
 
 def test_a_missing_field_is_named(tmp_path):
     write(tmp_path / "robotarium.toml", '[experiment]\ntitle = "x"\nmain = "main.py"\n')
-    with pytest.raises(ValueError, match="duration, robots, description"):
+    with pytest.raises(ValueError, match="robots, description"):
         load_project(tmp_path)
 
 
@@ -225,3 +226,14 @@ def test_a_home_glob_does_not_read_the_home_directory_as_a_pattern(tmp_path, mon
     monkeypatch.setenv("HOME", str(home))
     paths = experiment(tmp_path, files=["~/data/*.npy"]).upload_files()
     assert [path.name for path in paths] == ["main.py", "a.npy"]
+
+
+def test_duration_may_be_left_out_and_is_then_auto(tmp_path):
+    write(tmp_path / "robotarium.toml", '[experiment]\ntitle = "t"\ndescription = "d"\n'
+                                        'robots = 2\nmain = "main.py"\n')
+    write(tmp_path / "main.py", "")
+    assert load_project(tmp_path).experiment.duration == "auto"
+
+
+def test_measured_is_a_duration(tmp_path):
+    assert errors(experiment(tmp_path, duration="measured").check()) == []

@@ -76,8 +76,9 @@ robotarium history             # what was sent, and how it went
 your own, which is where the rest of the commands run and where `.robotarium/` collects bundles,
 run logs and the submission ledger.
 
-`submit` runs the simulator first, fills in the estimated duration from it (`duration =
-"auto"`), and prints the full plan before asking for a yes. The example's `robotarium.toml`
+`submit` runs the simulator first (the example sets `simulate = true`), declares the form's
+maximum duration of 600 s (`duration = "auto"`, the default; the run still ends when both robots
+arrive), and prints the full plan before asking for a yes. The example's `robotarium.toml`
 sets `draft = true`, so the experiment is **saved on the Robotarium as a draft, not queued**:
 check it on the [dashboard](https://www.robotarium.gatech.edu/dashboard) (title, two robots,
 `main.py` ticked as main), then submit it there or delete it. Use `robotarium submit --queue`
@@ -144,7 +145,7 @@ title = "Circle formation ({timestamp})"     # also {date} {time} {git} {robots}
 description = """
 Four GRITSBots drive to evenly spaced points on a circle.
 """
-duration = "auto"        # seconds, "90s", "2m", or "auto": measured in the simulator
+duration = "auto"        # the form's maximum, 600 s (the default); or "90s", "2m"; or "measured"
 robots = 4               # 1-18
 main = "main.py"         # the Main File
 files = ["helpers.py", "backend.jl", "data/*.npy"]   # supporting files; globs work
@@ -212,7 +213,7 @@ Before anything is sent, and as far as possible before anything is run:
   - `skip_initialization=True`, a drive the testbed never skips;
   - numpy spellings newer than the testbed's.
 - **Inside the Julia:** packages loaded but not declared; `include`d files not uploaded.
-- **In the simulator** (`simulate`, `submit --simulate`, or `duration = "auto"`): collisions and
+- **In the simulator** (`simulate`, `submit --simulate`, or `duration = "measured"`): collisions and
   leaving the arena (errors: the testbed rejects them), saturated wheel commands, the robot
   count actually used, whether the run fits its declared duration.
 - **Against the live site**, after logging in and before uploading: its current limits.

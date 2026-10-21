@@ -80,3 +80,8 @@ def test_what_is_not_a_literal_is_refused_here(value):
 def test_literals_round_trip():
     value = {"a": [1, 2.5, None, True, "ü \"q\""], "b": {"c": []}, "d": [[1] * 40]}
     assert ast.literal_eval(python_literal(value)) == value
+
+
+def test_auto_declares_the_forms_maximum(tmp_path):
+    bundle = build(experiment(tmp_path, duration="auto"), tmp_path / "out")
+    assert bundle.duration == 600

@@ -3,7 +3,7 @@ Submitting an experiment, start to finish, with every check in front of the netw
 
     1. bundle      the files laid out flat, as the testbed will see them (bundle.py)
     2. preflight   the fields, the files, and what is inside them (experiment.py, preflight.py)
-    3. simulate    optionally, and always for a duration of "auto" (simulate.py)
+    3. simulate    optionally, and always for a duration of "measured" (simulate.py)
     4. the plan    exactly what is about to be sent, printed, and a yes waited for
     5. send        log in, check the site's live limits, upload each file, create the
                    experiment, mark the main file
@@ -92,7 +92,7 @@ def prepare(target, simulate_first: bool = None, echo: bool = True,
     Args:
         target: A Project, an Experiment, or a path to a robotarium.toml.
         simulate_first (bool): Run the simulator; default as [submit] simulate says, and always
-            when the duration is "auto".
+            when the duration is "measured".
         echo (bool): Show the simulator's output as it runs.
         libraries_file: A libraries.txt to check imports against instead of the default.
     """
@@ -104,23 +104,23 @@ def prepare(target, simulate_first: bool = None, echo: bool = True,
     report = None
     findings = []
     wants_simulation = simulate_first or (simulate_first is None and project.simulate_first) \
-        or experiment.duration == "auto"
-    if experiment.duration == "auto" and simulate_first is False:
-        findings.append(Finding(ERROR, "The duration is \"auto\", which only a simulation can "
-                                       "settle; give a duration, or let it simulate."))
+        or experiment.duration == "measured"
+    if experiment.duration == "measured" and simulate_first is False:
+        findings.append(Finding(ERROR, "The duration is \"measured\", which only a simulation "
+                                       "can settle; give a duration, or let it simulate."))
     elif wants_simulation and bundle.main.suffix != ".py":
         findings.append(Finding(ERROR, "Only a Python main file can be simulated here, and %s "
                                        "is not one; give a duration and --no-simulate."
                                 % bundle.main.name))
     elif simulate_first or (simulate_first is None and project.simulate_first) \
-            or experiment.duration == "auto":
+            or experiment.duration == "measured":
         report = simulate.run(bundle, simulator=project.simulator_path,
                               fast=project.simulator_fast, headless=project.simulator_headless,
                               timeout=project.simulator_timeout,
                               log_dir=Path(project.output_dir) / "runs", echo=echo)
-        if experiment.duration == "auto":
+        if experiment.duration == "measured":
             if errors(report.findings()):
-                findings.append(Finding(ERROR, "The duration is \"auto\", and the simulation "
+                findings.append(Finding(ERROR, "The duration is \"measured\", and the simulation "
                                                "that would settle it failed."))
             else:
                 experiment = dataclasses.replace(experiment,
@@ -234,8 +234,16 @@ def submit(target, credentials=None, draft: bool = None, simulate_first: bool = 
         out("Logged in.")
 
         stage = "settings"
-        problems = check_against_settings(client.settings(), int(bundle.duration),
-                                          bundle.robots, bundle.files)
+        settings = client.settings()
+        # "auto" declares the maximum: the site's, should it ever be lower than the form's.
+        live_maximum = settings.get("maxDuration")
+        if prepared.experiment.duration == "auto" and live_maximum \
+                and int(live_maximum) < bundle.duration:
+            bundle.duration = int(live_maximum)
+            entry["duration"] = bundle.duration
+            out("Estimated duration: %d s, the site's current maximum." % bundle.duration)
+        problems = check_against_settings(settings, int(bundle.duration), bundle.robots,
+                                          bundle.files)
         if problems:
             raise RobotariumError("the site's current limits refuse it: %s" % " ".join(problems))
 

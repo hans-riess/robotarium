@@ -61,7 +61,7 @@ def test_the_walkthrough_end_to_end(tmp_path, fake_site, logged_in, capsys, monk
     create = next(each["json"] for each in fake_site if each["path"].endswith("create"))
     assert create["numRobots"] == "2" and create["status"] == "draft"
     assert create["title"].startswith("Two robots swap places (")
-    assert 60 <= int(create["estimatedDuration"]) <= 120
+    assert create["estimatedDuration"] == "600"
 
     assert cli.main(["history"]) == 0
     assert "experiment exp-1 saved as a draft" in capsys.readouterr().out

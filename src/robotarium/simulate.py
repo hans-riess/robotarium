@@ -18,7 +18,7 @@ agree with:
     ended           whether debug() / call_at_scripts_end() was called
 
 (init_steps + steps) x 0.033 s is the run's wall clock on the testbed, which is what "Estimated
-Duration" asks for; limits.suggested_duration adds headroom. A duration of "auto" in
+Duration" asks for; limits.suggested_duration adds headroom. A duration of "measured" in
 robotarium.toml is filled in from exactly that.
 
 The simulator is the `rps` package from robotarium_python_simulator. It is found the way Python
@@ -165,7 +165,8 @@ class SimulationReport:
                     and self.testbed_seconds > experiment.duration:
                 add(Finding(ERROR, "The run takes about %.0f s on the testbed, and the form "
                                    "would declare %d s; the testbed stops a run that outlasts "
-                                   "its declared duration. Declare %d, or \"auto\"."
+                                   "its declared duration. Declare %d, or \"auto\" (the "
+                                   "form's maximum)."
                                    % (self.testbed_seconds, experiment.duration,
                                       self.suggested_duration)))
             if self.testbed_seconds > limits.MAX_DURATION_SECONDS:

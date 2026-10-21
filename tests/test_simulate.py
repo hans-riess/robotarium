@@ -91,7 +91,9 @@ def test_the_scaffolded_experiment_runs_clean(project_dir):
 
 
 @needs_simulator
-def test_auto_takes_the_duration_from_the_simulation(project_dir):
+def test_measured_takes_the_duration_from_the_simulation(project_dir):
+    manifest = project_dir / "robotarium.toml"
+    manifest.write_text(manifest.read_text().replace('duration = "auto"', 'duration = "measured"'))
     prepared = prepare(project_dir, echo=False)
     assert prepared.experiment.duration == prepared.report.suggested_duration
     assert prepared.bundle.duration == prepared.report.suggested_duration

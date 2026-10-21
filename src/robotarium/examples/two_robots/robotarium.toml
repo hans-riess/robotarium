@@ -17,7 +17,7 @@ description = """\
 Two GRITSBots start 1.2 m apart, facing each other, and drive to each other's starting \
 point; a barrier certificate keeps them apart as they pass. The run ends when both arrive.\
 """
-duration = "auto"     # measured in the simulator before submitting
+duration = "auto"     # the form's maximum, 600 s: the run ends when both robots arrive
 robots = 2
 main = "main.py"
 
