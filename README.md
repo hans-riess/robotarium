@@ -71,6 +71,11 @@ robotarium submit              # check, show, confirm, send
 robotarium history             # what was sent, and how it went
 ```
 
+`init --example` copies the example out of the package (its source is
+[`src/robotarium/examples/two_robots/`](src/robotarium/examples/two_robots/)) into a folder of
+your own, which is where the rest of the commands run and where `.robotarium/` collects bundles,
+run logs and the submission ledger.
+
 `submit` runs the simulator first, fills in the estimated duration from it (`duration =
 "auto"`), and prints the full plan before asking for a yes. The example's `robotarium.toml`
 sets `draft = true`, so the experiment is **saved on the Robotarium as a draft, not queued**:
