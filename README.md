@@ -33,23 +33,51 @@ rather than at the end of the testbed's queue.
 ## Install
 
 Linux or macOS, both tested in CI; Windows is not supported yet
-([#2](https://github.com/hans-riess/robotarium/issues/2)). Python 3.11 or newer, in a virtual
-environment. Recent Linux distributions (Ubuntu 23.04+,
-Debian 12+) refuse `pip install` into the system Python with `externally-managed-environment`,
-and a venv is the right fix:
+([#2](https://github.com/hans-riess/robotarium/issues/2)). Python 3.11 or newer.
+
+### With uv: just the CLI
+
+[uv](https://docs.astral.sh/uv/) installs `robotarium` as a command in an environment of its
+own, with no virtual environment to create or activate. It fetches a suitable Python too, if
+yours is older than 3.11:
+
+```bash
+uv tool install "robotarium[sim,julia,keyring] @ git+https://github.com/hans-riess/robotarium.git"
+robotarium --help
+uv tool upgrade robotarium       # later: the latest main
+```
+
+The tool's environment holds only `robotarium` and its extras (numpy, matplotlib and the
+simulator among them). If your experiment imports something else (scipy, say), `robotarium
+simulate` needs it there too, so add it with `--with`, re-running the same install:
+
+```bash
+uv tool install --with scipy "robotarium[sim,julia,keyring] @ git+https://github.com/hans-riess/robotarium.git"
+```
+
+### From a clone: to change it, or without uv
+
+Recent Linux distributions (Ubuntu 23.04+, Debian 12+) refuse `pip install` into the system
+Python with `externally-managed-environment`, so install into a virtual environment:
 
 ```bash
 git clone https://github.com/hans-riess/robotarium
 cd robotarium
 python3 -m venv .venv            # on Ubuntu/Debian, if this fails: sudo apt install python3-venv
-source .venv/bin/activate        # each new terminal; Windows: .venv\Scripts\activate
+source .venv/bin/activate        # in each new terminal
 pip install -e ".[sim,julia,keyring]"
 ```
 
-Submitting needs only the standard library, so each extra is optional: `sim` installs the
-Robotarium simulator (`simulate`), `julia` installs juliacall (a `backend.jl`; Julia itself is
-downloaded on first use), and `keyring` lets `robotarium login` keep the password in the
-system keyring. `pip install -e .` alone is enough to bundle, check and submit.
+Packages an experiment needs go into the same venv: `pip install scipy`.
+
+### The extras
+
+Submitting needs only the standard library, so each extra is optional:
+- **`sim`** installs the Robotarium simulator, for `simulate`.
+- **`julia`** installs juliacall, for a `backend.jl`. Julia itself is downloaded on first use.
+- **`keyring`** lets `robotarium login` keep the password in the system keyring.
+
+Without any extras, `robotarium` can still bundle, check and submit.
 
 `[sim]` installs `rps` from the
 [robotarium_python_simulator](https://github.com/robotarium/robotarium_python_simulator)

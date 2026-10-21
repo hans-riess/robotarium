@@ -141,3 +141,15 @@ def test_login_refuses_a_password_that_is_not_text_without_showing_it(tmp_path, 
     assert cli.main(["login", "--store", "file", "--verify"]) == 1
     err = capsys.readouterr().err
     assert "not valid text" in err and "zqj" not in err and "xvk" not in err
+
+
+
+def test_output_cut_short_by_a_pipe_is_not_a_traceback(tmp_path):
+    import subprocess
+    import sys
+    cli.main(["init", str(tmp_path / "exp"), "--example", "two_robots"])
+    shell = subprocess.run("'%s' -m robotarium check '%s' | head -1"
+                           % (sys.executable, tmp_path / "exp"), shell=True,
+                           capture_output=True, text=True, timeout=120)
+    assert "Traceback" not in shell.stderr and "BrokenPipeError" not in shell.stderr
+    assert shell.stdout.strip() == "0 error(s), 0 warning(s)."

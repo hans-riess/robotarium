@@ -60,6 +60,12 @@ def main(argv=None) -> int:
     except KeyboardInterrupt:
         print("\nInterrupted.", file=sys.stderr)
         return 130
+    except BrokenPipeError:
+        # Whatever was reading the output stopped (`robotarium check | head`): nothing more to
+        # say, and no traceback. stdout is pointed at devnull so the flush at exit cannot fail
+        # the same way.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        return 1
 
 
 def build_parser() -> argparse.ArgumentParser:
