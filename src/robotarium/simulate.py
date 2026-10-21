@@ -238,9 +238,14 @@ def run(bundle, simulator=None, fast: bool = True, headless: bool = True, timeou
 
         # Output a console cannot show is replaced, never fatal: a reader that died would leave
         # the run blocked on a full pipe.
+        # On Windows the run gets its own process group, which is what lets a timeout send it
+        # Ctrl-Break (the shim takes that as Ctrl-C) rather than terminate it outright.
         process = subprocess.Popen(command, cwd=bundle.directory, env=environment,
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                   encoding="utf-8", errors="replace", bufsize=1)
+                                   encoding="utf-8", errors="replace", bufsize=1,
+                                   creationflags=getattr(subprocess,
+                                                         "CREATE_NEW_PROCESS_GROUP", 0)
+                                   if os.name == "nt" else 0)
         tail = collections.deque(maxlen=60)
         reader = threading.Thread(target=_relay, args=(process.stdout, tail, echo), daemon=True)
         reader.start()
@@ -300,16 +305,22 @@ def _relay(stream, tail, echo: bool) -> None:
 
 
 def _interrupt(process) -> None:
-    """Ctrl-C, where there is such a thing; elsewhere, terminate."""
+    """
+    Ctrl-C on POSIX; Ctrl-Break on Windows, which the shim takes as Ctrl-C. Either way the run
+    writes its report on the way out. Where neither can be sent, terminate.
+    """
     if process.poll() is not None:
         return
     try:
         if os.name == "posix":
             process.send_signal(signal.SIGINT)
         else:
+            process.send_signal(signal.CTRL_BREAK_EVENT)
+    except (OSError, ValueError, AttributeError):
+        try:
             process.terminate()
-    except OSError:
-        pass
+        except OSError:
+            pass
 
 
 def _kill(process) -> None:

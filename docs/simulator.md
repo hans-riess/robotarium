@@ -59,10 +59,10 @@ which otherwise never finishes, and no `except` in the main file can catch it. A
 this way, or by a timeout, gets no duration advice, because it doesn't show how long the whole
 run takes.
 
-`--timeout` bounds the wall clock as well. On Linux and macOS it stops the run with Ctrl-C, so
-the report is still written and lists the run's collisions and robot count along with the
-timeout. A run that ignores Ctrl-C is killed 10 s later. On Windows a timeout terminates the run
-outright, so its step count is unknown. If `robotarium` itself is ended, by Ctrl-C, a closed
+`--timeout` bounds the wall clock as well. It stops the run with Ctrl-C (Ctrl-Break on Windows,
+which the run takes the same way), so the report is still written and lists the run's
+collisions and robot count along with the timeout. A run that ignores it is killed 10 s later,
+and its step count is then unknown. If `robotarium` itself is ended, by Ctrl-C, a closed
 terminal, `timeout`, or a CI job being cancelled, the run is stopped with it rather than left
 running.
 

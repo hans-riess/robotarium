@@ -159,7 +159,7 @@ class Experiment:
         # Only what the entry spells is a pattern: the project's own directory (exp[1]/), or
         # the home directory a leading ~ stands for, must not be read as one.
         if text.startswith("~"):
-            head, _, rest = text.partition("/")
+            head, rest = re.match(r"(~[^/\\]*)[/\\]?(.*)", text, re.DOTALL).groups()
             pattern = os.path.join(glob.escape(os.path.expanduser(head)), rest)
         elif Path(text).is_absolute():
             pattern = text

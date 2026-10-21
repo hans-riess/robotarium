@@ -317,14 +317,16 @@ print("done")
 @needs_simulator
 def test_a_run_that_ends_while_its_output_is_drained_is_not_timed_out(tmp_path, monkeypatch):
     import time
+    # Few enough lines to fit any pipe's buffer (Windows' is small), so the run is finished
+    # long before the console, slowed below, has shown them all.
     experiment, bundle = _bundle_of(tmp_path, """\
-for index in range(2000):
+for index in range(300):
     print("line %d" % index)
 """)
     real_write = sys.stdout.write
 
     def slow(text):
-        time.sleep(0.002)
+        time.sleep(0.01)
         return real_write("")
 
     monkeypatch.setattr(sys.stdout, "write", slow)

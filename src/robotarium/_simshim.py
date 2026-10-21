@@ -20,6 +20,7 @@ import atexit
 import json
 import os
 import runpy
+import signal
 import sys
 import time
 import traceback
@@ -133,6 +134,10 @@ def write_report() -> None:
         Path(destination).write_text(json.dumps(REPORT), encoding="utf-8")
 
 
+def _interrupted(number, frame):
+    raise KeyboardInterrupt
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         print("usage: python -m robotarium._simshim MAIN_FILE", file=sys.stderr)
@@ -144,6 +149,11 @@ def main() -> int:
     # every run; that warning is about how the run is watched, not about the experiment.
     if os.environ.get("MPLBACKEND", "").lower() == "agg":
         warnings.filterwarnings("ignore", message=".*non-interactive, and thus cannot be shown")
+
+    # Windows has no SIGINT to send to another process; simulate.py sends Ctrl-Break instead,
+    # and it means the same here: stop, and report on the way out.
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, _interrupted)
 
     if not install(fast=os.environ.get("ROBOTARIUM_SIM_FAST") == "1"):
         print("The Robotarium simulator (rps) is not importable: %s" % REPORT["exception"],

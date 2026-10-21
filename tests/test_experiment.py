@@ -1,6 +1,7 @@
 """The experiment's fields and files, and reading them from robotarium.toml."""
 
 import datetime
+import os
 
 import pytest
 
@@ -224,8 +225,10 @@ def test_a_home_glob_does_not_read_the_home_directory_as_a_pattern(tmp_path, mon
     home = tmp_path / "home[me]"
     write(home / "data" / "a.npy", "")
     monkeypatch.setenv("HOME", str(home))
-    paths = experiment(tmp_path, files=["~/data/*.npy"]).upload_files()
-    assert [path.name for path in paths] == ["main.py", "a.npy"]
+    monkeypatch.setenv("USERPROFILE", str(home))     # what ~ means on Windows
+    for entry in ("~/data/*.npy", "~" + os.sep + "data" + os.sep + "*.npy"):
+        paths = experiment(tmp_path, files=[entry]).upload_files()
+        assert [path.name for path in paths] == ["main.py", "a.npy"]
 
 
 def test_duration_may_be_left_out_and_is_then_auto(tmp_path):
