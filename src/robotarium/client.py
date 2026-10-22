@@ -20,6 +20,18 @@ guessed), in the order a person clicking through "New Experiment" causes:
                                     sent for the main file's id: this is what ticking
                                     "Main File" amounts to.
 
+And what its experiment page (experiment/<id>) calls to show the results that come back:
+
+    GET  experiment/<id>            {"experiment": {"title", "status", "videoUrls",
+                                    "returnMessages", "scripts", "logFiles", "dataFiles", ...}};
+                                    the three lists hold file ids.
+    GET  experiment/get-queue/<id>  {"queue_position", "queue_length"}.
+    POST files/id_list              {"ids", "type"} -> [{"fileId", "name", "uploadDate",
+                                    "isMain"}, ...], type being "scripts", "logFiles" or
+                                    "dataFiles".
+    GET  files/preview/<type>/<id>  the file itself: what the page's download button fetches.
+    GET  <videoUrls>/download       the video, which the page plays from there.
+
 The API is not documented or versioned by the Robotarium team, so it can change under this
 module. docs/site-api.md says how it was read and how to re-read it.
 
@@ -32,6 +44,7 @@ import logging
 import mimetypes
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
@@ -48,6 +61,9 @@ DASHBOARD_URL = "https://www.robotarium.gatech.edu/dashboard"
 
 #: How long to wait on one request: for a stalled connection, not a slow one.
 TIMEOUT_SECONDS = 60
+
+#: How much of a download to hold in memory at once.
+CHUNK_BYTES = 1 << 20
 
 log = logging.getLogger(__name__)
 
@@ -178,50 +194,150 @@ class RobotariumClient:
             raise RobotariumError("Marking the main file refused: %s"
                                   % _reason(reply, "no reason"))
 
-    def _request(self, method: str, path: str, body: dict = None, files: dict = None):
+    def experiment(self, experiment_id: str) -> dict:
+        """
+        The experiment's record, as its page shows it: title, status, the video's address, the
+        return messages, and the ids of its scripts, log files and data files.
+
+        Args:
+            experiment_id (str): What create_experiment returned.
+        """
+        reply = self._request("GET", "experiment/%s" % urllib.parse.quote(experiment_id, safe=""))
+        if not isinstance(reply, dict) or not isinstance(reply.get("experiment"), dict):
+            raise RobotariumError("No experiment %s: %s"
+                                  % (experiment_id, _reason(reply, "no experiment in the reply")))
+        return reply["experiment"]
+
+    def queue_position(self, experiment_id: str) -> dict:
+        """Where a queued experiment stands: {"queue_position", "queue_length"}."""
+        return self._request("GET", "experiment/get-queue/%s"
+                             % urllib.parse.quote(experiment_id, safe=""))
+
+    def file_details(self, file_ids: list, file_type: str) -> list:
+        """
+        The name and upload date of each file, as the page lists them.
+
+        Args:
+            file_ids (list): Ids from the experiment's record.
+            file_type (str): Which list they came from: "scripts", "logFiles" or "dataFiles".
+        """
+        reply = self._request("POST", "files/id_list", body={"ids": list(file_ids),
+                                                             "type": file_type})
+        if not isinstance(reply, list):
+            raise RobotariumError("Listing the %s refused: %s"
+                                  % (file_type, _reason(reply, "no list in the reply")))
+        return reply
+
+    def download_file(self, file_id: str, file_type: str, sink) -> None:
+        """
+        Writes one of the experiment's files to sink, as the page's download button fetches it.
+
+        Args:
+            file_id (str): Its id.
+            file_type (str): "scripts", "logFiles" or "dataFiles".
+            sink: A file open for binary writing.
+        """
+        self._request("GET", "files/preview/%s/%s" % (urllib.parse.quote(file_type, safe=""),
+                                                      urllib.parse.quote(file_id, safe="")),
+                      sink=sink)
+
+    def download(self, url: str, sink) -> None:
+        """
+        Writes what an address the site gave out (the video's) holds to sink. The session token
+        goes with it only when the address is under the API root: the page plays the video
+        without one, and it may be stored elsewhere.
+
+        Args:
+            url (str): The address, absolute or relative to the API root.
+            sink: A file open for binary writing.
+        """
+        url = urllib.parse.urljoin(self.url, url)
+        if url.startswith(self.url):
+            self._request("GET", url[len(self.url):], sink=sink)
+        else:
+            parts = urllib.parse.urlsplit(url)
+            self._request("GET", url, sink=sink, authorized=False,
+                          label="%s://%s%s" % (parts.scheme, parts.netloc, parts.path))
+
+    def _request(self, method: str, path: str, body: dict = None, files: dict = None,
+                 sink=None, authorized: bool = True, label: str = None):
         """
         One call to the API, its JSON reply decoded. A refusal raises RobotariumError with the
         reason the site gave -- and with nothing of the request, which may hold the password.
         The debug log names the call and its outcome, never a body.
+
+        With sink, the reply is a file rather than JSON: it is written to sink as it arrives and
+        nothing is returned. path may then be a whole URL, named in messages by label (which
+        leaves out a query string that may sign it), and sent without the token if not
+        authorized.
         """
-        headers = {"Accept": "application/json"}
+        headers = {"Accept": "*/*" if sink is not None else "application/json"}
         data = None
         if body is not None:
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"
         elif files is not None:
             data, headers["Content-Type"] = _multipart(files)
-        if self.token:
-            headers["Authorization"] = "Bearer %s" % self.token
+        label = label or path
 
-        request = urllib.request.Request(self.url + path, data=data, headers=headers,
-                                         method=method)
-        log.debug("%s %s%s", method, path,
+        url = path if "://" in path else self.url + path
+        request = urllib.request.Request(url, data=data, headers=headers, method=method)
+        if self.token and authorized:
+            # Not carried over a redirect: a download may be handed to storage elsewhere.
+            request.add_unredirected_header("Authorization", "Bearer %s" % self.token)
+        log.debug("%s %s%s", method, label,
                   " (%d bytes)" % len(data) if data is not None and files else "")
         try:
             with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
-                payload = response.read()
-                log.debug("%s %s -> HTTP %d", method, path, response.status)
+                if sink is None:
+                    payload = response.read()
+                else:
+                    payload, received = None, 0
+                    for chunk in iter(lambda: response.read(CHUNK_BYTES), b""):
+                        received += len(chunk)
+                        try:
+                            sink.write(chunk)
+                        except OSError as error:
+                            raise _SinkFailed(error) from None
+                    # A read in pieces ends quietly where the connection did; the whole-body
+                    # read() above raises instead.
+                    expected = response.headers.get("Content-Length")
+                    if expected and expected.isdigit() and received < int(expected):
+                        raise ConnectionLost("%s %s was cut off after %d of %s bytes."
+                                             % (method, label, received, expected))
+                log.debug("%s %s -> HTTP %d", method, label, response.status)
+        except _SinkFailed as failed:
+            raise failed.error from None
         except urllib.error.HTTPError as error:
-            log.debug("%s %s -> HTTP %d", method, path, error.code)
+            log.debug("%s %s -> HTTP %d", method, label, error.code)
             try:
                 reply = _decode(error.read())
             except (OSError, http.client.HTTPException):
                 reply = {}  # an error page cut off or stalled: the status is the answer
             raise RobotariumError("%s %s answered HTTP %d: %s" % (
-                method, path, error.code, _reason(reply, error.reason)), status=error.code) \
+                method, label, error.code, _reason(reply, error.reason)), status=error.code) \
                 from None
         except urllib.error.URLError as error:
-            raise RobotariumError("Could not reach %s: %s" % (self.url, error.reason)) from None
+            raise RobotariumError("Could not reach %s: %s" % (
+                self.url if label == path else label, error.reason)) from None
         except http.client.InvalidURL as error:
-            raise RobotariumError("%s is not a usable API URL: %s" % (self.url, error)) from None
+            raise RobotariumError("%s is not a usable %s: %s" % (
+                (self.url, "API URL") if label == path else (label, "URL")) + (error,)) from None
         except (OSError, http.client.HTTPException) as error:
             # Raised from reading the reply, which urllib does not wrap: the request went out.
-            log.debug("%s %s -> no answer (%s)", method, path, type(error).__name__)
+            log.debug("%s %s -> no answer (%s)", method, label, type(error).__name__)
             raise ConnectionLost("%s %s got no answer: %s" % (
-                method, path, str(error) or type(error).__name__)) from None
+                method, label, str(error) or type(error).__name__)) from None
 
-        return _decode(payload)
+        return None if sink is not None else _decode(payload)
+
+
+class _SinkFailed(Exception):
+    """Writing a download failed here (a full disk), not on the way: not a lost connection."""
+
+    def __init__(self, error: OSError):
+        super().__init__(str(error))
+        self.error = error
 
 
 def experiment_form(title: str, description: str, duration_seconds: int, robots: int,

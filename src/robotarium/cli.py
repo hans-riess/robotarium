@@ -7,6 +7,7 @@ The `robotarium` command line.
     robotarium simulate [--show]                rehearse it in the Robotarium simulator
     robotarium submit [--dry-run] [--draft]     check, show, confirm, send, record
     robotarium history                          what has been sent, and how it went
+    robotarium fetch [EXPERIMENT]               what came back: video, logs, data, messages
     robotarium login | logout | credentials     where the Robotarium login is kept
     robotarium limits                           the site's live limits
     robotarium julia lookup NAME                a [julia] packages entry, from the registry
@@ -29,7 +30,7 @@ from pathlib import Path
 
 from . import credentials as credentials_module
 from . import julia as julia_tools
-from . import ledger, libraries, limits, preflight, scaffold, simulate, submission
+from . import ledger, libraries, limits, preflight, results, scaffold, simulate, submission
 from ._version import __version__
 from .bundle import BundleError, build
 from .client import RobotariumClient, RobotariumError
@@ -152,6 +153,26 @@ def build_parser() -> argparse.ArgumentParser:
     command.add_argument("-n", type=int, default=0, metavar="N", help="only the last N")
     command.add_argument("--json", action="store_true", help="the raw ledger entries")
     command.set_defaults(handler=run_history)
+
+    command = commands.add_parser("fetch", help="download what came back from the testbed: "
+                                                "video, log files, data files, return messages")
+    command.add_argument("experiment", nargs="?", metavar="EXPERIMENT",
+                         help="the experiment's id or the address of its page (default: the "
+                              "last one submitted from here, from the ledger)")
+    command.add_argument("--project", type=Path, default=Path("."), metavar="PATH",
+                         help="robotarium.toml, or a directory at or under it, whose ledger and "
+                              ".robotarium/ to use (default .)")
+    command.add_argument("-o", "--out", type=Path, metavar="DIR",
+                         help="put the files here (default .robotarium/results/<id>/)")
+    command.add_argument("--no-video", action="store_false", dest="video",
+                         help="leave out the video, which can be large")
+    command.add_argument("--scripts", action="store_true",
+                         help="also download the files as uploaded")
+    command.add_argument("--force", action="store_true",
+                         help="download again what is already there")
+    command.add_argument("--env-file", type=Path, metavar="FILE",
+                         help="read ROBOTARIUM_USERNAME/PASSWORD from this dotenv file")
+    command.set_defaults(handler=run_fetch)
 
     command = commands.add_parser("login", help="keep the Robotarium login for later runs")
     command.add_argument("--store", choices=("keyring", "file"), default=None,
@@ -374,6 +395,37 @@ def run_history(arguments) -> int:
         print("Nothing submitted yet from here (%s)." % (Path(output_dir) / ledger.LEDGER_NAME))
         return 0
     print("\n\n".join(ledger.describe(entry) for entry in entries))
+    return 0
+
+
+def run_fetch(arguments) -> int:
+    manifest = find_manifest(arguments.project)
+    project = load_project(manifest) if manifest else None
+    output_dir = project.output_dir if project else Path(arguments.project) / ".robotarium"
+    if arguments.experiment:
+        experiment_id = results.experiment_id_from(arguments.experiment)
+    else:
+        entry = results.last_submitted(output_dir)
+        if entry is None:
+            raise ValueError("No experiment given, and none submitted from here (%s). Name one: "
+                             "robotarium fetch <id or page address>."
+                             % (Path(output_dir) / ledger.LEDGER_NAME))
+        experiment_id = entry["experiment_id"]
+        print("The last experiment submitted from here: %s (%s)"
+              % (entry.get("title"), entry.get("submitted_at")))
+    found = credentials_module.resolve(project_root=manifest.parent if manifest else None,
+                                       env_file=arguments.env_file)
+    client = RobotariumClient()
+    client.login(found.username, found.password)
+    directory = arguments.out or results.directory_for(output_dir, experiment_id)
+    try:
+        result = results.fetch(experiment_id, directory, client=client, video=arguments.video,
+                               scripts=arguments.scripts, force=arguments.force)
+    except OSError as error:
+        print("robotarium: could not save the results: %s" % error, file=sys.stderr)
+        return 1
+    print()
+    print(results.describe(result))
     return 0
 
 
