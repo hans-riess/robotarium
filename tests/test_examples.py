@@ -9,7 +9,7 @@ import pytest
 from robotarium import cli, ledger, scaffold
 from robotarium.experiment import load_project
 
-from conftest import HAS_SIMULATOR
+from conftest import HAS_SIMULATOR, FakeRobotarium
 
 needs_simulator = pytest.mark.skipif(not HAS_SIMULATOR, reason="rps is not installed")
 
@@ -66,3 +66,9 @@ def test_the_walkthrough_end_to_end(tmp_path, fake_site, logged_in, capsys, monk
     assert cli.main(["history"]) == 0
     assert "experiment exp-1 saved as a draft" in capsys.readouterr().out
     assert ledger.read(directory / ".robotarium")[-1]["outcome"] == "submitted"
+
+    FakeRobotarium.experiments = {"exp-1": {"title": create["title"], "status": "draft",
+                                            "scripts": [], "logFiles": [], "dataFiles": []}}
+    assert cli.main(["fetch"]) == 0
+    assert "It is a draft" in capsys.readouterr().out
+    assert (directory / ".robotarium" / "results" / "exp-1" / "experiment.json").is_file()

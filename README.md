@@ -3,7 +3,8 @@
 Automation for [Georgia Tech Robotarium](https://www.robotarium.gatech.edu/) submissions.
 Describe an experiment once (title, estimated duration, description, number of robots, the files
 and which one is main), then check it, rehearse it in the simulator, and submit it from the
-command line or from Python, without the web form.
+command line or from Python, without the web form. Once it has run, download what came back
+(the video, log files, data files and return messages) the same way.
 
 ```bash
 robotarium init my_experiment          # a working experiment to start from
@@ -101,6 +102,7 @@ robotarium submit --dry-run    # exactly what would be sent; nothing is
 robotarium login --verify      # once: keep your login (see Credentials below)
 robotarium submit              # check, show, confirm, send
 robotarium history             # what was sent, and how it went
+robotarium fetch               # its status now; once it has run, the video, logs and data
 ```
 
 `init --example` copies the example out of the package (its source is
@@ -114,11 +116,13 @@ arrive), and prints the full plan before asking for a yes. The example's `robota
 sets `draft = true`, so the experiment is **saved on the Robotarium as a draft, not queued**:
 check it on the [dashboard](https://www.robotarium.gatech.edu/dashboard) (title, two robots,
 `main.py` ticked as main), then submit it there or delete it. Use `robotarium submit --queue`
-when you do want it to run on the physical robots.
+when you do want it to run on the physical robots. `robotarium fetch` reports a draft as a
+draft; once a queued experiment has run, it downloads the results into
+`.robotarium/results/<experiment id>/`.
 
 The same walkthrough runs in this repository's tests against a local stand-in for the site
 (`tests/test_examples.py`). Against the real site it runs only when asked for, since it leaves a
-draft on your account:
+draft on your account; it then fetches that draft back, to check the calls `fetch` makes:
 
 ```bash
 ROBOTARIUM_LIVE_TEST=1 pytest -m live        # with your login available, as below
@@ -129,7 +133,8 @@ or from GitHub: **Actions → Live test → Run workflow**, once the repository 
 
 ## Credentials
 
-`submit` logs in with the email address and password you use on the Robotarium website. **The
+`submit`, `fetch` and `limits` log in with the email address and password you use on the
+Robotarium website. **The
 password is never taken on the command line, never printed, and never written to the submission
 ledger.** Keep it in one of these, listed in order of preference:
 
@@ -217,7 +222,7 @@ testbed as `Path(__file__).parent / "name.npy"`.
 | `robotarium simulate [--show] [--simulator PATH]` | Run the bundle in the Robotarium simulator and judge the run as the testbed would. See [docs/simulator.md](docs/simulator.md). |
 | `robotarium submit [--dry-run] [--draft\|--queue] [--simulate] [-y]` | Bundle, check, optionally simulate, **print exactly what will be sent and wait for a yes**, then upload every file, create the experiment, mark the main file, and record the attempt. |
 | `robotarium history [-n N] [--json]` | The submission ledger. |
-| `robotarium fetch [EXPERIMENT] [-o DIR] [--no-video] [--scripts]` | Download what came back from the testbed: the video, log files, data files and return messages. See [Results](#results-robotarium-fetch). |
+| `robotarium fetch [EXPERIMENT] [-o DIR] [--no-video] [--scripts] [--force]` | Download what came back from the testbed: the video, log files, data files and return messages. See [Results](#results-robotarium-fetch). |
 | `robotarium login`, `logout`, `credentials` | Where the login is kept. |
 | `robotarium limits` | The site's live limits (robots, duration, file types). |
 | `robotarium julia lookup NAME...` | A `[julia] packages` entry from Julia's General registry. |
@@ -225,7 +230,9 @@ testbed as `Path(__file__).parent / "name.npy"`.
 | `robotarium inspect RUN.npz` | What a `RunLogger` file holds. |
 
 Every experiment command takes the manifest (or a directory at or under it) as an optional
-positional argument; the default is the current directory. `robotarium -v ...` logs each step,
+positional argument; the default is the current directory. `fetch` is the exception: its
+positional is the experiment (an id or its page's address), and `--project PATH` names the
+manifest whose ledger and `.robotarium/` it uses. `robotarium -v ...` logs each step,
 and `--log-file FILE` keeps that log.
 
 ## What gets checked
@@ -307,6 +314,9 @@ backend locally exactly as the testbed will. `robotarium init --julia` is a work
   `.robotarium/snapshots/`. It holds no credentials and is safe to commit.
 - **The tool:** `-v` and `--log-file` show each step and each API call (never a body or a
   secret).
+- **Results:** `robotarium fetch` keeps what the testbed returned for each experiment in
+  `.robotarium/results/<experiment id>/`, beside the snapshot of what was sent. See
+  [Results](#results-robotarium-fetch) below.
 
 See [docs/logging.md](docs/logging.md).
 
@@ -369,8 +379,8 @@ print(returned.status, returned.written, returned.return_messages)
 `submit(..., confirm=False)` sends without asking. `confirm` may also be a function that's
 given the plan text and returns whether to send. Lower-level pieces are importable too:
 `robotarium.client.RobotariumClient` (login, upload, create, mark main, and the calls `fetch`
-makes),
-`robotarium.credentials.resolve`, `robotarium.simulate.run`, and `robotarium.preflight.check`.
+makes), `robotarium.credentials.resolve`, `robotarium.simulate.run`, and
+`robotarium.preflight.check`.
 
 ## How it talks to the site
 
@@ -388,5 +398,6 @@ pytest
 
 The suite never contacts the real site. Submission is tested end to end against a local
 stand-in that records every request, including checks that the password never appears in clear
-text and that nothing is sent without a yes. The simulator tests run the real `rps` and are
-skipped where it isn't installed.
+text and that nothing is sent without a yes. Fetching results is tested against the same
+stand-in, including a download cut off halfway and file names that try to leave their folder.
+The simulator tests run the real `rps` and are skipped where it isn't installed.
