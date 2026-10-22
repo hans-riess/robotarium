@@ -426,6 +426,10 @@ def run_fetch(arguments) -> int:
         return 1
     print()
     print(results.describe(result))
+    if result.failed:
+        print("robotarium: %d download(s) failed; fetch again to retry them."
+              % len(result.failed), file=sys.stderr)
+        return 1
     return 0
 
 

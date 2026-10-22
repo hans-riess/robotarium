@@ -30,7 +30,8 @@ And what its experiment page (experiment/<id>) calls to show the results that co
                                     "isMain"}, ...], type being "scripts", "logFiles" or
                                     "dataFiles".
     GET  files/preview/<type>/<id>  the file itself: what the page's download button fetches.
-    GET  <videoUrls>/download       the video, which the page plays from there.
+    GET  <videoUrls>/download       the video, which the page plays from there. "-" when
+                                    the run made none, "" before it has run.
 
 The API is not documented or versioned by the Robotarium team, so it can change under this
 module. docs/site-api.md says how it was read and how to re-read it.
@@ -64,6 +65,10 @@ TIMEOUT_SECONDS = 60
 
 #: How much of a download to hold in memory at once.
 CHUNK_BYTES = 1 << 20
+
+#: The Content-Types a video may arrive as: a video's own, or the generic one storage gives a
+#: file it knows nothing about.
+VIDEO_TYPES = ("video/", "application/octet-stream")
 
 log = logging.getLogger(__name__)
 
@@ -241,7 +246,19 @@ class RobotariumClient:
                                                       urllib.parse.quote(file_id, safe="")),
                       sink=sink)
 
-    def download(self, url: str, sink) -> None:
+    def download_video(self, video_url: str, sink) -> None:
+        """
+        Writes the experiment's video to sink, from <videoUrls>/download as the page plays it.
+        Refused with RobotariumError, before anything is written, when the reply is not a video:
+        the site answers an address it has no route for with its own page, HTML with HTTP 200.
+
+        Args:
+            video_url (str): The record's videoUrls (one of them, when it lists several).
+            sink: A file open for binary writing.
+        """
+        self.download("%s/download" % video_url, sink, expect=video_problem)
+
+    def download(self, url: str, sink, expect=None) -> None:
         """
         Writes what an address the site gave out (the video's) holds to sink. The session token
         goes with it only when the address is under the API root: the page plays the video
@@ -250,17 +267,20 @@ class RobotariumClient:
         Args:
             url (str): The address, absolute or relative to the API root.
             sink: A file open for binary writing.
+            expect: A function given the reply's Content-Type and its first chunk that returns
+                why the reply is not what was asked for, or None when it is; a reason refuses
+                the download with RobotariumError before anything reaches sink.
         """
         url = urllib.parse.urljoin(self.url, url)
         if url.startswith(self.url):
-            self._request("GET", url[len(self.url):], sink=sink)
+            self._request("GET", url[len(self.url):], sink=sink, expect=expect)
         else:
             parts = urllib.parse.urlsplit(url)
-            self._request("GET", url, sink=sink, authorized=False,
+            self._request("GET", url, sink=sink, authorized=False, expect=expect,
                           label="%s://%s%s" % (parts.scheme, parts.netloc, parts.path))
 
     def _request(self, method: str, path: str, body: dict = None, files: dict = None,
-                 sink=None, authorized: bool = True, label: str = None):
+                 sink=None, authorized: bool = True, label: str = None, expect=None):
         """
         One call to the API, its JSON reply decoded. A refusal raises RobotariumError with the
         reason the site gave -- and with nothing of the request, which may hold the password.
@@ -269,7 +289,8 @@ class RobotariumClient:
         With sink, the reply is a file rather than JSON: it is written to sink as it arrives and
         nothing is returned. path may then be a whole URL, named in messages by label (which
         leaves out a query string that may sign it), and sent without the token if not
-        authorized.
+        authorized. expect, if given, is shown the Content-Type and the first chunk before
+        anything is written, as download() describes.
         """
         headers = {"Accept": "*/*" if sink is not None else "application/json"}
         data = None
@@ -293,12 +314,19 @@ class RobotariumClient:
                     payload = response.read()
                 else:
                     payload, received = None, 0
-                    for chunk in iter(lambda: response.read(CHUNK_BYTES), b""):
+                    chunk = response.read(CHUNK_BYTES)
+                    problem = expect and expect(response.headers.get("Content-Type", ""), chunk)
+                    if problem:
+                        log.debug("%s %s -> HTTP %d, %s", method, label, response.status, problem)
+                        raise RobotariumError("%s %s answered HTTP %d with %s." % (
+                            method, label, response.status, problem), status=response.status)
+                    while chunk:
                         received += len(chunk)
                         try:
                             sink.write(chunk)
                         except OSError as error:
                             raise _SinkFailed(error) from None
+                        chunk = response.read(CHUNK_BYTES)
                     # A read in pieces ends quietly where the connection did; the whole-body
                     # read() above raises instead.
                     expected = response.headers.get("Content-Length")
@@ -338,6 +366,32 @@ class _SinkFailed(Exception):
     def __init__(self, error: OSError):
         super().__init__(str(error))
         self.error = error
+
+
+def video_problem(content_type: str, head: bytes) -> str:
+    """
+    Why a reply is not a video, or None when it is: an MP4 (its "ftyp" box at offset 4), or
+    anything sent as a video or as generic binary that does not read as a web page. The status
+    alone does not say: the site answers an address it has no route for with its own page,
+    HTML with HTTP 200.
+
+    Args:
+        content_type (str): The reply's Content-Type header; empty when it sent none.
+        head (bytes): The reply's first chunk; empty when the reply was.
+    """
+    if head[4:8] == b"ftyp":
+        return None
+    kind = content_type.split(";")[0].strip().lower()
+    markup = head.lstrip(b"\xef\xbb\xbf \t\r\n")[:1] in (b"<", b"{")
+    if head and not markup and kind.startswith(VIDEO_TYPES):
+        return None
+    if not head:
+        what = "an empty reply"
+    elif b"<html" in head[:1024].lower() or b"<!doctype html" in head[:1024].lower():
+        what = "a web page"
+    else:
+        what = "something else"
+    return "%s (%s), not a video" % (what, kind or "no Content-Type")
 
 
 def experiment_form(title: str, description: str, duration_seconds: int, robots: int,

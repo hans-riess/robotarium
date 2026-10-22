@@ -341,10 +341,13 @@ robotarium fetch https://www.robotarium.gatech.edu/experiment/6716f0a1b2...   # 
 ```
 
 It prints the return messages, and for an experiment that hasn't run yet, its status and its
-place in the queue. Fetching again downloads only what's new; `--force` downloads everything
-again. `--no-video` leaves out the video (it can be large), `--scripts` adds the files as
-uploaded, and `-o DIR` puts it all somewhere else. The `.gitignore` that `init` writes keeps
-results out of git with the rest of `.robotarium/`.
+place in the queue. A run that made no video says so instead of asking for one, and an
+experiment queued again after running says that its earlier run's files are no longer listed.
+A download that fails (the video, say) doesn't stop the rest: `fetch` gets everything else,
+reports what failed and exits 1. Fetching again downloads only what's new; `--force`
+downloads everything again. `--no-video` leaves out the video (it can be large), `--scripts`
+adds the files as uploaded, and `-o DIR` puts it all somewhere else. The `.gitignore` that
+`init` writes keeps results out of git with the rest of `.robotarium/`.
 
 ## From Python
 

@@ -1,11 +1,13 @@
-"""The API client: what the form posts, the live limits, and refusals."""
+"""The API client: what the form posts, the live limits, refusals, and what a video is."""
+
+import io
 
 import pytest
 
 from robotarium.client import (RobotariumClient, RobotariumError, check_against_settings,
-                               experiment_form)
+                               experiment_form, video_problem)
 
-from conftest import PASSWORD, USERNAME
+from conftest import APP_PAGE, PASSWORD, USERNAME
 
 
 def test_the_form_sends_numbers_as_the_text_inputs_do():
@@ -59,3 +61,42 @@ def test_a_password_that_is_not_text_is_refused_without_quoting_it(fake_site):
     with pytest.raises(RobotariumError, match="not valid text") as error:
         RobotariumClient().login(USERNAME, "zqj\udcffxvk")
     assert "zqj" not in str(error.value) and "xvk" not in str(error.value) and fake_site == []
+
+
+MP4 = b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00"
+
+
+@pytest.mark.parametrize("content_type, head", [
+    ("video/mp4", MP4),
+    ("application/octet-stream", MP4),
+    ("binary/octet-stream", MP4),
+    ("", MP4),
+    ("video/webm", b"\x1aE\xdf\xa3\x9fB\x86\x81\x01"),
+    ("application/octet-stream; charset=binary", b"\x00\x00\x01\xbaD\x00\x04"),
+])
+def test_a_video_is_known_by_its_bytes_or_its_type(content_type, head):
+    assert video_problem(content_type, head) is None
+
+
+@pytest.mark.parametrize("content_type, head, said", [
+    ("text/html; charset=utf-8", APP_PAGE, "a web page (text/html), not a video"),
+    ("application/octet-stream", APP_PAGE, "a web page (application/octet-stream)"),
+    ("video/mp4", b"\xef\xbb\xbf  <!DOCTYPE html><html>", "a web page (video/mp4)"),
+    ("application/json", b'{"message": "Not found"}', "something else (application/json)"),
+    ("video/mp4", b"", "an empty reply (video/mp4)"),
+    ("", b"\x00\x01\x02\x03\x04\x05\x06\x07", "something else (no Content-Type)"),
+])
+def test_anything_else_is_not_a_video(content_type, head, said):
+    assert said in video_problem(content_type, head)
+
+
+def test_a_video_that_comes_back_as_a_web_page_writes_nothing(fake_site):
+    client = RobotariumClient()
+    client.login(USERNAME, PASSWORD)
+    sink = io.BytesIO()
+    with pytest.raises(RobotariumError, match=r"answered HTTP 200 with a web page \(text/html\), "
+                                              r"not a video") as error:
+        client.download_video("/experiment/exp-1", sink)
+    assert sink.getvalue() == b"" and error.value.status == 200 and not error.value.uncertain
+    assert fake_site[-1]["path"] == "/experiment/exp-1/download"
+    assert fake_site[-1]["authorization"] is None

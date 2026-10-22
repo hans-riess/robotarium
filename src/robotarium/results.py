@@ -12,23 +12,26 @@ files.
 
 A file already there is kept, so fetching again after more has come back downloads only what is
 new; force replaces them. Each download goes to a .part file first and is renamed when complete,
-so an interrupted one is never mistaken for a finished one.
+so an interrupted one is never mistaken for a finished one. One that fails is noted in the
+result's failed list and the rest are still downloaded.
 
     from robotarium.results import fetch
     result = fetch("6716f0...", ".robotarium/results/6716f0...")
     print(result.status, result.written)
 """
 
+import email.utils
 import json
 import logging
 import re
 import urllib.parse
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 from . import credentials as credentials_module
 from . import ledger
-from .client import RobotariumClient, RobotariumError
+from .client import RobotariumClient, RobotariumError, video_problem
 
 RESULTS_DIR = "results"
 
@@ -42,6 +45,10 @@ SECTIONS = (
 
 #: Statuses after which nothing more comes back.
 FINISHED = ("completed", "error", "failed", "cancelled", "canceled", "rejected")
+
+#: What the record holds in place of an address or an id when there is none: videoUrls is "-"
+#: for a run that made no video and "" for one that has not run.
+NOTHING = ("", "-")
 
 log = logging.getLogger(__name__)
 
@@ -60,6 +67,8 @@ class FetchResult:
         missing (list): Sections the site has nothing in yet, by name.
         return_messages (str): The return messages as text; None when there are none.
         queue (dict): {"queue_position", "queue_length"} while it waits; None otherwise.
+        failed (list): What could not be downloaded, as (file, reason) pairs; the file is the
+            section's name instead when the section could not be listed.
     """
 
     experiment_id: str
@@ -70,6 +79,7 @@ class FetchResult:
     missing: list = field(default_factory=list)
     return_messages: str = None
     queue: dict = None
+    failed: list = field(default_factory=list)
 
     @property
     def status(self) -> str:
@@ -78,6 +88,23 @@ class FetchResult:
     @property
     def finished(self) -> bool:
         return self.status.lower() in FINISHED
+
+    @property
+    def requeued(self) -> bool:
+        """
+        Whether it has been queued again after running: unfinished, yet with a finishedAt (no
+        later than its lastUpdatedAt, when both can be read). The site then lists nothing of the
+        earlier run.
+        """
+        finished_at = self.experiment.get("finishedAt")
+        if self.finished or self.status == "draft" or not finished_at:
+            return False
+        finished_at = _parse_date(finished_at)
+        updated_at = _parse_date(self.experiment.get("lastUpdatedAt"))
+        try:
+            return finished_at is None or updated_at is None or finished_at <= updated_at
+        except TypeError:  # one with a time zone, one without
+            return True
 
 
 def experiment_id_from(text: str) -> str:
@@ -158,26 +185,36 @@ def fetch(experiment_id: str, directory: Path, client: RobotariumClient = None,
     else:
         result.missing.append("return messages")
 
-    urls = experiment.get("videoUrls")
-    urls = [urls] if isinstance(urls, str) else [each for each in urls or [] if each]
+    urls = _listed(experiment.get("videoUrls"))
     if not urls:
         result.missing.append("video")
+        if video:
+            out("  no video: the site lists none%s" % ("" if result.finished else " yet"))
     elif video:
         for number, url in enumerate(urls, 1):
             target = directory / ("video.mp4" if number == 1 else "video-%d.mp4" % number)
-            _download(result, target, force, out,
-                      lambda sink, url=url: client.download("%s/download" % url, sink))
+            again = target.exists() and not force and not _holds_a_video(target)
+            if again:
+                out("  %s here is not a video (an earlier fetch saved a web page as one): "
+                    "downloading it again" % target.name)
+            _download(result, target, force or again, out,
+                      lambda sink, url=url: client.download_video(url, sink))
 
     for key, file_type, folder, label in SECTIONS:
         if key == "scripts" and not scripts:
             continue
-        ids = experiment.get(key) or []
-        ids = [ids] if isinstance(ids, str) else [each for each in ids if each]
+        ids = _listed(experiment.get(key))
         if not ids:
             result.missing.append(label)
             continue
+        try:
+            listed = client.file_details(ids, file_type)
+        except RobotariumError as error:
+            out("  could not list the %s: %s" % (label, error))
+            result.failed.append((label, str(error)))
+            continue
         taken = set()
-        for details in client.file_details(ids, file_type):
+        for details in listed:
             file_id = details.get("fileId")
             if not file_id:
                 continue
@@ -197,14 +234,17 @@ def describe(result: FetchResult) -> str:
     if queue.get("queue_position") is not None:
         lines.append("  number %s of %s in the queue" % (queue["queue_position"],
                                                          queue.get("queue_length", "?")))
-    for key, label in (("createdAt", "created"), ("finishedAt", "finished")):
+    earlier = " (its earlier run)" if result.requeued else ""
+    for key, label, note in (("createdAt", "created", ""), ("finishedAt", "finished", earlier)):
         if experiment.get(key):
-            lines.append("  %-10s %s" % (label, experiment[key]))
+            lines.append("  %-10s %s%s" % (label, experiment[key], note))
     lines.append("")
     for path in result.written:
         lines.append("  wrote   %s" % path)
     for path in result.kept:
         lines.append("  kept    %s" % path)
+    for what, reason in result.failed:
+        lines.append("  failed  %s: %s" % (what, reason))
     if result.missing:
         lines.append("  %s: %s" % ("nothing came back for" if result.finished
                                    else "not available yet", ", ".join(result.missing)))
@@ -217,26 +257,75 @@ def describe(result: FetchResult) -> str:
                                                           "return_messages.txt"))
     if result.status == "draft":
         lines += ["", "It is a draft: submit it from the dashboard to have it run."]
+    elif result.requeued:
+        lines += ["", "This experiment has been queued again; files from its earlier run are no "
+                      "longer listed. Fetch again once it has run."]
     elif not result.finished:
         lines += ["", "It has not finished: fetch again once it has run."]
     return "\n".join(lines)
 
 
 def _download(result: FetchResult, target: Path, force: bool, out, write) -> None:
-    """One file, through a .part file, unless it is already there."""
+    """
+    One file, through a .part file, unless it is already there. A failure, the site's or this
+    machine's, is noted in result.failed rather than raised: the other files are still worth
+    having.
+    """
     if target.exists() and not force:
         result.kept.append(target)
         return
-    target.parent.mkdir(parents=True, exist_ok=True)
     partial = target.with_name(target.name + ".part")
     out("  downloading %s ..." % target.relative_to(result.directory))
     try:
-        with open(partial, "wb") as sink:
-            write(sink)
-        partial.replace(target)
-    finally:
-        partial.unlink(missing_ok=True)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(partial, "wb") as sink:
+                write(sink)
+            partial.replace(target)
+        finally:
+            partial.unlink(missing_ok=True)
+    except (RobotariumError, OSError) as error:
+        out("    failed, nothing saved: %s" % error)
+        result.failed.append((target, str(error)))
+        return
     result.written.append(target)
+
+
+def _holds_a_video(path: Path) -> bool:
+    """Whether a file already here begins as a video does, rather than as a web page."""
+    try:
+        with open(path, "rb") as file:
+            head = file.read(1024)
+    except OSError:
+        return True  # unreadable: left as it is, as any file already here is
+    return video_problem("application/octet-stream", head) is None
+
+
+def _listed(value) -> list:
+    """
+    The addresses or ids a record's field holds, as a list, leaving out the placeholders
+    (NOTHING) it holds when there are none: one string, a list of them, or nothing at all.
+    """
+    values = value if isinstance(value, (list, tuple)) else [value]
+    values = [each.strip() if isinstance(each, str) else each for each in values]
+    return [each for each in values if each and each not in NOTHING]
+
+
+def _parse_date(text):
+    """
+    A date from the record, as the site writes them ("Thu, 22 Oct 2026 14:24:26 GMT") or in
+    ISO form; None when it is neither.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return None
+    try:
+        return email.utils.parsedate_to_datetime(text)
+    except (TypeError, ValueError, IndexError):
+        pass
+    try:
+        return datetime.fromisoformat(text.strip())
+    except ValueError:
+        return None
 
 
 def _safe_name(name, file_id: str, taken: set) -> str:

@@ -23,6 +23,12 @@ PASSWORD = "not-a-real-password"
 HAS_SIMULATOR = importlib.util.find_spec("rps") is not None and \
     importlib.util.find_spec("cvxopt") is not None
 
+#: What the site answers any address outside /api/ with: its single-page app, with HTTP 200.
+APP_PAGE = (b"<!doctype html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"utf-8\">\n"
+            b"  <title>Robotarium</title>\n  <base href=\"/\">\n</head>\n"
+            b"<body>\n  <app-root></app-root>\n  <script src=\"main.js\"></script>\n</body>\n"
+            b"</html>\n")
+
 
 @pytest.fixture(autouse=True)
 def isolated(tmp_path, monkeypatch):
@@ -135,6 +141,8 @@ class FakeRobotarium(BaseHTTPRequestHandler):
             return self._reply(type(self).settings)
         if self.path in type(self).videos:
             return self._send_bytes(type(self).videos[self.path], "video/mp4")
+        if not self.path.startswith("/api/"):
+            return self._send_bytes(APP_PAGE, "text/html; charset=utf-8")
         if self.headers.get("Authorization") != "Bearer jwt-token":
             return self._reply({"msg": "Missing Authorization Header"}, status=401)
         if self.path.startswith("/api/experiment/get-queue/"):

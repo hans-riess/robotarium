@@ -26,7 +26,13 @@ what came back:
 | `GET <videoUrls>/download` | | the video (MP4) | **Experiment Video** |
 
 The page plays the video from `<videoUrls>/download` without the session token, so `fetch` sends
-the token there only when the address is under the API root. The page only checks whether
+the token there only when the address is under the API root. `videoUrls` is `"-"` for a run that
+made no video and `""` for one that hasn't run, and `fetch` asks for neither. The site answers
+any address outside the API with its single-page app (HTML, HTTP 200), so `fetch` keeps a video
+only when the reply is one: an MP4's `ftyp` box at offset 4, or a `video/*` or
+`application/octet-stream` reply that doesn't read as a web page. An experiment queued again
+after it ran is back to `"submitted"`, with the earlier run's `finishedAt` (before
+`lastUpdatedAt`) and empty `logFiles` and `dataFiles`. The page only checks whether
 `returnMessages` is present and never shows its shape, so `fetch` writes it out as text whatever
 it holds. A download that redirects elsewhere (to storage, say) never carries the token with it.
 
