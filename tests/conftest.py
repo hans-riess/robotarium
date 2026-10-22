@@ -60,9 +60,28 @@ class FakeRobotarium(BaseHTTPRequestHandler):
     mark_main_reply = {"message": "updated"}
     #: A reply to give to experiment/create instead of success.
     create_reply = {"experimentId": "exp-1", "status": "success", "message": "Experiment created"}
+    #: Experiments by id, as GET experiment/<id> answers with them.
+    experiments = {}
+    #: Files by id: (name, content). Downloaded from files/preview/<type>/<id>.
+    stored = {}
+    #: Videos by path, served outside /api/ as the site may.
+    videos = {}
+    #: A path whose reply is cut off halfway through.
+    truncate = None
 
     def log_message(self, *arguments):
         pass
+
+    def _send_bytes(self, body: bytes, content_type: str):
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.path == type(self).truncate:
+            self.wfile.write(body[:len(body) // 2])
+            self.close_connection = True
+            return
+        self.wfile.write(body)
 
     def _reply(self, payload, status=200):
         body = json.dumps(payload).encode("utf-8")
@@ -102,12 +121,34 @@ class FakeRobotarium(BaseHTTPRequestHandler):
             return self._reply({"file_id": "file-%s" % record["filename"]})
         if self.path == "/api/experiment/create":
             return self._reply(type(self).create_reply)
+        if self.path == "/api/files/id_list":
+            if record["authorization"] != "Bearer jwt-token":
+                return self._reply({"msg": "Missing Authorization Header"}, status=401)
+            return self._reply([{"fileId": each, "name": type(self).stored[each][0],
+                                 "uploadDate": "2026-10-22T14:24:26", "isMain": False}
+                                for each in record["json"]["ids"] if each in type(self).stored])
         return self._reply({"message": "no such route"}, status=404)
 
     def do_GET(self):
         self._record()
         if self.path == "/api/settings/":
             return self._reply(type(self).settings)
+        if self.path in type(self).videos:
+            return self._send_bytes(type(self).videos[self.path], "video/mp4")
+        if self.headers.get("Authorization") != "Bearer jwt-token":
+            return self._reply({"msg": "Missing Authorization Header"}, status=401)
+        if self.path.startswith("/api/experiment/get-queue/"):
+            return self._reply({"queue_position": 3, "queue_length": 7})
+        if self.path.startswith("/api/experiment/"):
+            experiment = type(self).experiments.get(self.path.rsplit("/", 1)[-1])
+            if experiment is None:
+                return self._reply({"message": "Experiment not found"}, status=404)
+            return self._reply({"status": "success", "experiment": experiment})
+        if self.path.startswith("/api/files/preview/"):
+            file_id = self.path.rsplit("/", 1)[-1]
+            if file_id in type(self).stored:
+                return self._send_bytes(type(self).stored[file_id][1],
+                                        "application/octet-stream")
         return self._reply({"message": "no such route"}, status=404)
 
     def do_PUT(self):
@@ -119,6 +160,8 @@ class FakeRobotarium(BaseHTTPRequestHandler):
 def fake_site(monkeypatch):
     """A stand-in for the site on localhost, with ROBOTARIUM_API_URL pointed at it."""
     FakeRobotarium.requests = []
+    FakeRobotarium.experiments, FakeRobotarium.stored, FakeRobotarium.videos = {}, {}, {}
+    FakeRobotarium.truncate = None
     server = HTTPServer(("127.0.0.1", 0), FakeRobotarium)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

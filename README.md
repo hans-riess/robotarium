@@ -11,6 +11,7 @@ cd my_experiment
 robotarium simulate --show             # watch it in the Robotarium simulator
 robotarium submit                      # check, show exactly what will be sent, confirm, send
 robotarium history                     # what was sent, when, and how it went
+robotarium fetch                       # what came back: video, log files, data, messages
 ```
 
 This package generalises the submission tooling built for
@@ -27,6 +28,7 @@ rather than at the end of the testbed's queue.
 - [On the testbed: `robotarium_runtime`](#on-the-testbed-robotarium_runtime)
 - [Julia: the backend.jl method](#julia-the-backendjl-method)
 - [Logging](#logging)
+- [Results: `robotarium fetch`](#results-robotarium-fetch)
 - [From Python](#from-python)
 - [Development](#development)
 
@@ -215,6 +217,7 @@ testbed as `Path(__file__).parent / "name.npy"`.
 | `robotarium simulate [--show] [--simulator PATH]` | Run the bundle in the Robotarium simulator and judge the run as the testbed would. See [docs/simulator.md](docs/simulator.md). |
 | `robotarium submit [--dry-run] [--draft\|--queue] [--simulate] [-y]` | Bundle, check, optionally simulate, **print exactly what will be sent and wait for a yes**, then upload every file, create the experiment, mark the main file, and record the attempt. |
 | `robotarium history [-n N] [--json]` | The submission ledger. |
+| `robotarium fetch [EXPERIMENT] [-o DIR] [--no-video] [--scripts]` | Download what came back from the testbed: the video, log files, data files and return messages. See [Results](#results-robotarium-fetch). |
 | `robotarium login`, `logout`, `credentials` | Where the login is kept. |
 | `robotarium limits` | The site's live limits (robots, duration, file types). |
 | `robotarium julia lookup NAME...` | A `[julia] packages` entry from Julia's General registry. |
@@ -307,6 +310,32 @@ backend locally exactly as the testbed will. `robotarium init --julia` is a work
 
 See [docs/logging.md](docs/logging.md).
 
+## Results: `robotarium fetch`
+
+Once an experiment has run, its page on the site has a video, return messages, data files and
+log files. `fetch` downloads all of them:
+
+```bash
+robotarium fetch                     # the last experiment submitted from here (the ledger's)
+robotarium fetch 6716f0a1b2...       # any experiment of yours, by id
+robotarium fetch https://www.robotarium.gatech.edu/experiment/6716f0a1b2...   # or its page
+```
+
+```
+.robotarium/results/<experiment id>/
+    experiment.json         the record: title, status, dates, robots, ...
+    return_messages.txt     what the testbed said about the run, if anything
+    video.mp4               the overhead video
+    logs/log.txt            the run's output
+    data/                   what the run saved beside its main file (a RunLogger's .npz, say)
+```
+
+It prints the return messages, and for an experiment that hasn't run yet, its status and its
+place in the queue. Fetching again downloads only what's new; `--force` downloads everything
+again. `--no-video` leaves out the video (it can be large), `--scripts` adds the files as
+uploaded, and `-o DIR` puts it all somewhere else. The `.gitignore` that `init` writes keeps
+results out of git with the rest of `.robotarium/`.
+
 ## From Python
 
 ```python
@@ -330,17 +359,23 @@ prepared = prepare(experiment, simulate_first=True)   # bundle + every check + s
 for finding in prepared.findings:
     print(finding)
 result = submit(experiment, confirm=True)             # asks on the terminal before sending
+
+# later, what came back
+from robotarium.results import fetch
+returned = fetch(result.experiment_id, "results/consensus")
+print(returned.status, returned.written, returned.return_messages)
 ```
 
 `submit(..., confirm=False)` sends without asking. `confirm` may also be a function that's
 given the plan text and returns whether to send. Lower-level pieces are importable too:
-`robotarium.client.RobotariumClient` (login, upload, create, mark main),
+`robotarium.client.RobotariumClient` (login, upload, create, mark main, and the calls `fetch`
+makes),
 `robotarium.credentials.resolve`, `robotarium.simulate.run`, and `robotarium.preflight.check`.
 
 ## How it talks to the site
 
-There is no documented Robotarium API. `robotarium.client` makes the same five calls the
-website's own JavaScript makes, including encrypting the password the way its login page does.
+There is no documented Robotarium API. `robotarium.client` makes the same calls the website's
+own JavaScript makes, including encrypting the password the way its login page does.
 [docs/site-api.md](docs/site-api.md) lists them and explains how to re-read them if the site
 changes.
 

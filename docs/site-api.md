@@ -14,6 +14,22 @@ causes. They were read from the site's main JavaScript bundle (first for
 | `POST experiment/create` | `title`, `estimatedDuration`, `description`, `numRobots`, `demo`, `scripts` (the file ids), `status` (`"submitted"` or `"draft"`), `exp_type` (`"ground"`) | `{"experimentId", "status", "message"}` | **Submit Experiment** / **Save Experiment** |
 | `PUT files/update_metadata/<main id>` | `{"metadata": [{"fileId", "experimentId", "isMain"}, ...]}` | | ticking **Main File** |
 
+`robotarium fetch` makes the calls the experiment's own page (`/experiment/<id>`) makes to show
+what came back:
+
+| Call | Body | Reply | Page equivalent |
+|---|---|---|---|
+| `GET experiment/<id>` | | `{"experiment": {"title", "status", "createdAt", "finishedAt", "videoUrls", "returnMessages", "scripts", "logFiles", "dataFiles", ...}}`; the last three are lists of file ids | the page itself |
+| `GET experiment/get-queue/<id>` | | `{"queue_position", "queue_length"}` | the queue position shown while it waits |
+| `POST files/id_list` | `{"ids", "type"}`, `type` being `"scripts"`, `"logFiles"` or `"dataFiles"` | `[{"fileId", "name", "uploadDate", "isMain"}, ...]` | the **Scripts**, **Data Files** and **Log Files** tables |
+| `GET files/preview/<type>/<file id>` | | the file | a table's **Download** button |
+| `GET <videoUrls>/download` | | the video (MP4) | **Experiment Video** |
+
+The page plays the video from `<videoUrls>/download` without the session token, so `fetch` sends
+the token there only when the address is under the API root. The page only checks whether
+`returnMessages` is present and never shows its shape, so `fetch` writes it out as text whatever
+it holds. A download that redirects elsewhere (to storage, say) never carries the token with it.
+
 Every call after login sends `Authorization: Bearer <token>`. Numbers in the experiment form are
 sent as strings, as the form's text inputs send them.
 
@@ -29,11 +45,12 @@ transit.
 
 Because the API is undocumented, the site can change it at any time. The symptoms would be a
 `RobotariumError` naming an HTTP status, or a reply missing the field this client expects
-(`token`, `file_id`, `experimentId`). To re-read the API:
+(`token`, `file_id`, `experimentId`, `experiment`). To re-read the API:
 
 1. Open https://www.robotarium.gatech.edu, log in, and open the browser's developer tools on the
    **Network** tab.
 2. Create a draft experiment by hand: upload two files, tick **Main File**, **Save Experiment**.
+   For `fetch`, open a completed experiment's page from the dashboard and download a log file.
 3. Compare the requests (paths, bodies, field names) with the table above and with
    `src/robotarium/client.py`.
 

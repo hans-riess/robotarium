@@ -12,6 +12,7 @@ ROBOTARIUM_LIVE_TEST). The draft is saved, not queued: nothing runs on the physi
 Delete it from https://www.robotarium.gatech.edu/dashboard afterwards.
 """
 
+import json
 import os
 
 import pytest
@@ -53,3 +54,12 @@ def test_the_example_is_saved_as_a_draft(tmp_path, capsys):
     entry = ledger.read(directory / ".robotarium")[-1]
     assert entry["outcome"] == "submitted" and entry["experiment_id"]
     print("Saved draft %s; delete it from the dashboard." % entry["experiment_id"])
+
+    # Read it back as `fetch` reads results: the record, and the uploaded files by their ids.
+    capsys.readouterr()
+    assert cli.main(["fetch", "--project", str(directory), "--scripts"]) == 0, \
+        capsys.readouterr().err
+    results = directory / ".robotarium" / "results" / entry["experiment_id"]
+    assert json.loads((results / "experiment.json").read_text())["status"] == "draft"
+    assert (results / "scripts" / "main.py").read_bytes() == \
+        (directory / ".robotarium" / "bundle" / "main.py").read_bytes()

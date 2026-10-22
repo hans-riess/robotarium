@@ -1,12 +1,14 @@
 # Logging
 
-Three kinds of record are kept, for three different questions.
+Three kinds of record are kept, for three different questions. A fourth, what the testbed
+sends back, is downloaded by `robotarium fetch`.
 
 | Question | Record | Where |
 |---|---|---|
 | What did the robots do? | `RunLogger`, in your main file | beside the main file on the testbed; `.robotarium/runs/` in simulation |
 | What did I send, and when? | the submission ledger and snapshots | `.robotarium/submissions.jsonl`, `.robotarium/snapshots/` |
 | What did `robotarium` itself do? | `-v` / `--log-file` | stderr / a file you name |
+| What came back from the testbed? | `robotarium fetch`: video, log files, data files, return messages | `.robotarium/results/<experiment id>/` |
 
 ## In the experiment: `RunLogger`
 
@@ -47,7 +49,8 @@ r.debug()
 
 On the testbed the file is written beside the main file. That's where the simulator's
 `data_saving` example saves its `.npy` files, and where robosheaf's run logs land, for the
-Robotarium to return with the experiment's results. In `robotarium simulate`,
+Robotarium to return with the experiment's results; `robotarium fetch` downloads them into
+`.robotarium/results/<experiment id>/data/`. In `robotarium simulate`,
 `ROBOTARIUM_LOG_DIR` points it at `.robotarium/runs/` instead. `RunLogger(directory=...)`
 overrides both.
 
