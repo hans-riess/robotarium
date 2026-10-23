@@ -83,8 +83,9 @@ barrier = create_si_barrier_certificate_with_boundary(magnitude_limit=0.1)
 angles = np.linspace(0, 2 * np.pi, N, endpoint=False)
 goals = float(CONFIG["radius"]) * np.vstack([np.cos(angles), np.sin(angles)])
 
-# Written beside main.py, which on the testbed is what comes back with the results; rewritten
-# every 300 steps so a run stopped at its declared duration still leaves its data.
+# Rewritten every 300 steps, so a run stopped at its declared duration still leaves its data.
+# The testbed hasn't been returning data files, so each write is also printed into its
+# log.txt, and `robotarium fetch` turns that back into the .npz.
 log = RunLogger("circle", autosave_every=300, meta={"goals": goals.tolist()})
 
 for step in range(ITERATIONS):

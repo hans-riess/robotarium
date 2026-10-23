@@ -78,6 +78,7 @@ anything it rejects.
 ## Run logs
 
 `RunLogger` writes into `.robotarium/runs/` during a simulation, rather than into the bundle.
+The copy of each write that it prints for the testbed's `log.txt` shows as one line of output.
 Read a log back with:
 
 ```bash

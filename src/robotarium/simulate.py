@@ -41,6 +41,7 @@ from pathlib import Path
 from . import limits
 from .credentials import PASSWORD_VARIABLE, USERNAME_VARIABLE
 from .findings import ERROR, INFO, WARNING, Finding
+from .results import BASE64_LINE, COPY_BEGIN, COPY_END
 
 SIMULATOR_VARIABLE = "ROBOTARIUM_SIMULATOR"
 
@@ -292,9 +293,23 @@ def run(bundle, simulator=None, fast: bool = True, headless: bool = True, timeou
 def _relay(stream, tail, echo: bool) -> None:
     """
     Copies the run's output to the console as it comes, keeping the last lines. It reads to
-    the end whatever the console does, since the run blocks once the pipe is full.
+    the end whatever the console does, since the run blocks once the pipe is full. The copy of
+    its file a RunLogger prints for the testbed's log.txt is shown as one line, not as base64.
     """
+    copying = None
     for line in stream:
+        text = line.strip()
+        if copying:
+            if text == COPY_END % copying:
+                copying = None
+                continue
+            if BASE64_LINE.match(text):
+                continue
+        begun = COPY_BEGIN.match(text)
+        if begun:
+            copying = begun.group(1)
+            line = "(a copy of %s, %.1f KB, printed for the testbed's log.txt)\n" % (
+                copying, int(begun.group(2)) / 1e3)
         tail.append(line)
         if echo:
             try:

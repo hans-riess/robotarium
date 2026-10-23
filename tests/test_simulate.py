@@ -1,5 +1,9 @@
 """Rehearsing in the Robotarium simulator: what the report says and what it is judged by."""
 
+import base64
+import collections
+import hashlib
+import io
 import os
 import sys
 
@@ -411,3 +415,16 @@ def test_the_run_writes_utf8_whatever_the_console(tmp_path, monkeypatch):
     experiment, bundle = _bundle_of(tmp_path, 'print("café ✓ θ")\n')
     report = simulate.run(bundle, echo=False, timeout=60)
     assert report.returncode == 0 and "café ✓ θ" in report.output
+
+
+def test_a_run_logs_copy_is_one_line_on_the_console(capsys):
+    content = b"PK" * 3000
+    stream = io.StringIO("step 1\n-----BEGIN ROBOTARIUM RUN run_1.npz %d %s-----\n%s"
+                         "-----END ROBOTARIUM RUN run_1.npz-----\nRun log: run_1.npz\n" % (
+                             len(content), hashlib.sha256(content).hexdigest(),
+                             base64.encodebytes(content).decode("ascii")))
+    tail = collections.deque(maxlen=60)
+    simulate._relay(stream, tail, echo=True)
+    shown = ["step 1\n", "(a copy of run_1.npz, 6.0 KB, printed for the testbed's log.txt)\n",
+             "Run log: run_1.npz\n"]
+    assert list(tail) == shown and capsys.readouterr().out == "".join(shown)

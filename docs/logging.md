@@ -5,7 +5,7 @@ sends back, is downloaded by `robotarium fetch`.
 
 | Question | Record | Where |
 |---|---|---|
-| What did the robots do? | `RunLogger`, in your main file | beside the main file on the testbed; `.robotarium/runs/` in simulation |
+| What did the robots do? | `RunLogger`, in your main file | on the testbed, printed into `log.txt` for `robotarium fetch` to write back out; `.robotarium/runs/` in simulation |
 | What did I send, and when? | the submission ledger and snapshots | `.robotarium/submissions.jsonl`, `.robotarium/snapshots/` |
 | What did `robotarium` itself do? | `-v` / `--log-file` | stderr / a file you name |
 | What came back from the testbed? | `robotarium fetch`: video, log files, data files, return messages | `.robotarium/results/<experiment id>/` |
@@ -46,13 +46,40 @@ r.debug()
   robot count, commit and file hashes (from `robotarium_bundle.py`), the start time, the Python
   and numpy versions, your `meta`, and the notes. A file that comes back from the testbed days
   later can be matched to the exact files that produced it.
+- **Each write is also printed**, for the testbed's `log.txt`. See below.
 
-On the testbed the file is written beside the main file. That's where the simulator's
-`data_saving` example saves its `.npy` files, and where robosheaf's run logs land, for the
-Robotarium to return with the experiment's results; `robotarium fetch` downloads them into
-`.robotarium/results/<experiment id>/data/`. In `robotarium simulate`,
+On the testbed the file is written beside the main file. In `robotarium simulate`,
 `ROBOTARIUM_LOG_DIR` points it at `.robotarium/runs/` instead. `RunLogger(directory=...)`
 overrides both.
+
+### On the testbed: the copy in `log.txt`
+
+The testbed returns what a run prints, as `log.txt`, but so far none of the files it writes: no
+`.npz` or `.npy` has come back, whether it was written beside the main file or in the working
+directory ([#7](https://github.com/hans-riess/robotarium/issues/7)). So each time `RunLogger`
+writes its file, it also prints the file, base64-encoded between two marker lines:
+
+```
+-----BEGIN ROBOTARIUM RUN formation_20261021_153102.npz 182344 <its SHA-256>-----
+UEsDBC0AAAAIAAAAIQDoNKiT//////////8JABQAcG9zZXMubnB5AQAQAOAAAAAAAAAATAAAAAAA
+...
+-----END ROBOTARIUM RUN formation_20261021_153102.npz-----
+```
+
+`robotarium fetch` finds these copies in `logs/log.txt` and writes each one into `data/` as the
+`.npz` it was. A copy is used only if it matches its size and SHA-256, so one that was cut short
+is never mistaken for the file.
+
+- **Autosaves print too.** Every write prints the whole file again, so with `autosave_every`
+  the log holds several copies, each longer than the last. `fetch` keeps the last complete one.
+  If the run was stopped while printing a copy, that's the one before, and `fetch` says so.
+- **Mind the size.** A copy is a third larger than the file. A run that records a lot and
+  autosaves often makes a long `log.txt`.
+- **When.** A copy is printed whenever stdout isn't a terminal: on the testbed, and in
+  `robotarium simulate`, which shows each copy as one line. `RunLogger(stdout_copy=False)` turns
+  it off; `stdout_copy=True` prints it in a terminal too.
+- **If the Robotarium starts returning data files**, `fetch` downloads them as well, and keeps
+  the site's file over a copy of the same name.
 
 Reading a log back:
 

@@ -307,7 +307,9 @@ backend locally exactly as the testbed will. `robotarium init --julia` is a work
 
 - **In the experiment:** `RunLogger` records any per-step quantities to a self-describing
   `.npz` (bundle title, commit, file hashes, notes), autosaving so that a run stopped at its
-  declared duration still leaves data. `robotarium inspect` reads it.
+  declared duration still leaves data. `robotarium inspect` reads it. The testbed hasn't been
+  returning data files, so each write is also printed into the run's `log.txt`, and
+  `robotarium fetch` turns it back into the `.npz`.
 - **Submissions:** `.robotarium/submissions.jsonl` records every attempt, successful or not,
   with the experiment id, form values and file hashes. A failed attempt also records the stage
   it failed at and what it left on the site. A zip snapshot of exactly what was uploaded goes to
@@ -323,7 +325,7 @@ See [docs/logging.md](docs/logging.md).
 ## Results: `robotarium fetch`
 
 Once an experiment has run, its page on the site has a video, return messages, data files and
-log files. `fetch` downloads all of them:
+log files. `fetch` downloads all of them, and copies each `RunLogger` file out of `log.txt`:
 
 ```bash
 robotarium fetch                     # the last experiment submitted from here (the ledger's)
@@ -337,7 +339,7 @@ robotarium fetch https://www.robotarium.gatech.edu/experiment/6716f0a1b2...   # 
     return_messages.txt     what the testbed said about the run, if anything
     video.mp4               the overhead video
     logs/log.txt            the run's output
-    data/                   what the run saved beside its main file (a RunLogger's .npz, say)
+    data/                   the data files, and each RunLogger .npz copied out of log.txt
 ```
 
 It prints the return messages, and for an experiment that hasn't run yet, its status and its
