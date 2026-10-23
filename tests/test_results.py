@@ -3,14 +3,17 @@ Fetching what comes back from the testbed, against a stand-in for the site: the 
 return messages, the video, the log and data files, where they land, and what is not sent.
 """
 
+import base64
+import hashlib
 import json
 import os
 
 import pytest
+from robotarium_runtime import COPY_BEGIN, COPY_END
 
 from robotarium import cli, ledger
 from robotarium.client import ConnectionLost, RobotariumClient, RobotariumError
-from robotarium.results import describe, experiment_id_from, fetch
+from robotarium.results import describe, experiment_id_from, fetch, run_copies
 
 from conftest import PASSWORD, USERNAME, FakeRobotarium
 
@@ -172,3 +175,71 @@ def test_the_command_without_an_experiment_or_a_ledger_says_so(fake_site, logged
     assert cli.main(["fetch"]) == 1
     assert "No experiment given, and none submitted from here" in capsys.readouterr().err
     assert fake_site == []
+
+
+def printed(name, content):
+    """A file as a RunLogger prints it into the run's output."""
+    return "%s\n%s%s\n" % (COPY_BEGIN % (name, len(content), hashlib.sha256(content).hexdigest()),
+                           base64.encodebytes(content).decode("ascii"), COPY_END % name)
+
+
+def ran(log_text, data_files=()):
+    """A finished experiment whose log.txt is log_text."""
+    FakeRobotarium.stored = {"log-1": ("log.txt", log_text.encode("utf-8"))}
+    FakeRobotarium.stored.update({"data-%d" % number: each
+                                  for number, each in enumerate(data_files, 1)})
+    FakeRobotarium.experiments = {"exp-4": {
+        "title": "Consensus", "status": "completed", "logFiles": ["log-1"],
+        "dataFiles": ["data-%d" % number for number in range(1, len(data_files) + 1)]}}
+
+
+def test_the_run_logs_printed_into_log_txt_come_back_as_data(fake_site, tmp_path):
+    early, final = b"PK early" * 50, b"PK final" * 500
+    ran("starting\n" + printed("run_1.npz", early) + "step 300\n" + printed("run_1.npz", final)
+        + "done\n")
+    result = fetch("exp-4", tmp_path, client=logged_in_client(), out=lambda *_: None)
+    assert (tmp_path / "data" / "run_1.npz").read_bytes() == final
+    assert result.missing == ["return messages", "video"]
+    assert "wrote   %s (copied out of log.txt)" % (tmp_path / "data" / "run_1.npz") \
+        in describe(result)
+
+    again = fetch("exp-4", tmp_path, client=logged_in_client(), out=lambda *_: None)
+    assert tmp_path / "data" / "run_1.npz" in again.kept
+
+
+def test_a_copy_cut_short_falls_back_to_the_one_before(fake_site, tmp_path):
+    whole = printed("run_1.npz", b"PK early" * 50)
+    ran(whole + printed("run_1.npz", b"PK final" * 500)[:300] + "\nKilled\n"
+        + printed("run_2.npz", b"PK other" * 50)[:200])
+    result = fetch("exp-4", tmp_path, client=logged_in_client(), out=lambda *_: None)
+    assert (tmp_path / "data" / "run_1.npz").read_bytes() == b"PK early" * 50
+    assert not (tmp_path / "data" / "run_2.npz").exists()
+    text = describe(result)
+    assert "The last copy of run_1.npz in logs/log.txt is incomplete" in text
+    assert "data/run_1.npz is the one before it." in text
+    assert "run_2.npz in logs/log.txt is incomplete (the run may have been stopped while " \
+           "printing it); there is no complete one." in text
+
+
+def test_a_data_file_the_site_returned_is_kept_over_a_copy(fake_site, tmp_path):
+    ran(printed("run_1.npz", b"PK from the log"), data_files=[("run_1.npz", b"PK from the site")])
+    result = fetch("exp-4", tmp_path, client=logged_in_client(), force=True, out=lambda *_: None)
+    assert (tmp_path / "data" / "run_1.npz").read_bytes() == b"PK from the site"
+    assert result.recovered == {}
+
+
+def test_a_copy_survives_other_output_inside_it_and_its_name_cannot_leave_data(fake_site,
+                                                                               tmp_path):
+    lines = printed("my run.npz", b"PK spaced" * 40).splitlines(keepends=True)
+    lines.insert(3, "UserWarning: something, printed meanwhile\n")
+    ran("".join(lines) + printed("../../escape.npz", b"PK escape"))
+    fetch("exp-4", tmp_path / "out", client=logged_in_client(), out=lambda *_: None)
+    assert (tmp_path / "out" / "data" / "my run.npz").read_bytes() == b"PK spaced" * 40
+    assert (tmp_path / "out" / "data" / "escape.npz").exists()
+    assert not (tmp_path / "escape.npz").exists()
+
+
+def test_a_copy_that_does_not_match_its_checksum_is_not_used():
+    block = printed("run_1.npz", b"PK final" * 20).splitlines()
+    block[1] = "A" * len(block[1])
+    assert run_copies("\n".join(block)) == ({}, ["run_1.npz"])

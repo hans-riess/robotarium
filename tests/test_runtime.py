@@ -2,12 +2,15 @@
 
 import importlib.abc
 import importlib.util
+import io
 import json
 import sys
 import types
 
 import numpy as np
 import pytest
+
+from robotarium.results import run_copies
 
 from conftest import write
 
@@ -233,3 +236,47 @@ def test_two_loggers_of_one_name_write_two_files(tmp_path, fresh_runtime):
     first = fresh_runtime.RunLogger("same", directory=tmp_path, save_at_exit=False)
     second = fresh_runtime.RunLogger("same", directory=tmp_path, save_at_exit=False)
     assert first.path != second.path
+
+
+def test_each_write_is_also_printed_for_the_testbeds_log(tmp_path, fresh_runtime, capsys):
+    log = fresh_runtime.RunLogger("demo", directory=tmp_path, autosave_every=2,
+                                  save_at_exit=False, echo=False, stdout_copy=True)
+    for step in range(3):
+        print("step %d" % step)
+        log.record(poses=np.full((3, 2), step))
+    path = log.save()
+    out = capsys.readouterr().out
+    assert out.count("-----BEGIN ROBOTARIUM RUN %s " % path.name) == 2
+    found, damaged = run_copies(out)
+    assert found == {path.name: path.read_bytes()} and damaged == []
+
+
+class Terminal(io.StringIO):
+    def isatty(self):
+        return True
+
+
+def test_by_default_a_terminal_gets_no_copy(tmp_path, fresh_runtime, monkeypatch, capsys):
+    log = fresh_runtime.RunLogger(directory=tmp_path, save_at_exit=False)
+    log.record(x=1)
+    log.save()
+    assert "BEGIN ROBOTARIUM RUN" in capsys.readouterr().out
+    terminal = Terminal()
+    monkeypatch.setattr(sys, "stdout", terminal)
+    log.save()
+    assert terminal.getvalue() == ""
+
+
+def test_a_write_that_fails_still_leaves_the_copy(tmp_path, fresh_runtime, monkeypatch,
+                                                  capsys):
+    log = fresh_runtime.RunLogger(directory=tmp_path, save_at_exit=False, stdout_copy=True)
+    log.record(x=1)
+
+    def read_only(*arguments):
+        raise OSError("Read-only file system")
+
+    monkeypatch.setattr(fresh_runtime.os, "replace", read_only)
+    with pytest.raises(OSError):
+        log.save()
+    assert list(run_copies(capsys.readouterr().out)[0]) == [log.path.name]
+    assert list(tmp_path.iterdir()) == []

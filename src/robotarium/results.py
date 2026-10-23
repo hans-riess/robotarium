@@ -7,8 +7,12 @@ files.
         return_messages.txt     what the testbed said about the run, when it said anything
         video.mp4               the overhead video
         logs/                   the log files (log.txt)
-        data/                   the data files the run saved beside its main file
+        data/                   the data files, and the RunLogger files copied out of log.txt
         scripts/                the files as uploaded, with --scripts
+
+So far the testbed has returned what a run prints but none of the files it writes
+(hans-riess/robotarium#7), so robotarium_runtime.RunLogger also prints each write of its file,
+base64-encoded between marker lines; fetch decodes those copies back into data/.
 
 A file already there is kept, so fetching again after more has come back downloads only what is
 new; force replaces them. Each download goes to a .part file first and is renamed when complete,
@@ -19,6 +23,9 @@ so an interrupted one is never mistaken for a finished one.
     print(result.status, result.written)
 """
 
+import base64
+import binascii
+import hashlib
 import json
 import logging
 import re
@@ -43,6 +50,12 @@ SECTIONS = (
 #: Statuses after which nothing more comes back.
 FINISHED = ("completed", "error", "failed", "cancelled", "canceled", "rejected")
 
+#: The lines a RunLogger prints a copy of its file between, as robotarium_runtime's COPY_BEGIN
+#: and COPY_END write them: the name, the size in bytes and the SHA-256, then base64.
+COPY_BEGIN = re.compile(r"^-----BEGIN ROBOTARIUM RUN (.+) (\d+) ([0-9a-f]{64})-----$")
+COPY_END = "-----END ROBOTARIUM RUN %s-----"
+BASE64_LINE = re.compile(r"^[A-Za-z0-9+/=]+$")
+
 log = logging.getLogger(__name__)
 
 
@@ -60,6 +73,9 @@ class FetchResult:
         missing (list): Sections the site has nothing in yet, by name.
         return_messages (str): The return messages as text; None when there are none.
         queue (dict): {"queue_position", "queue_length"} while it waits; None otherwise.
+        recovered (dict): The files in written and kept copied out of a log file, each to the
+            log file it came from.
+        damaged (list): What could not be copied out of the log files, as sentences.
     """
 
     experiment_id: str
@@ -70,6 +86,8 @@ class FetchResult:
     missing: list = field(default_factory=list)
     return_messages: str = None
     queue: dict = None
+    recovered: dict = field(default_factory=dict)
+    damaged: list = field(default_factory=list)
 
     @property
     def status(self) -> str:
@@ -117,7 +135,8 @@ def fetch(experiment_id: str, directory: Path, client: RobotariumClient = None,
           out=print) -> FetchResult:
     """
     Downloads what the site holds for an experiment into directory: its record, return
-    messages, video, log files and data files (and with scripts, the uploaded files).
+    messages, video, log files and data files (and with scripts, the uploaded files). The
+    RunLogger files a log file holds copies of are written into data/ too.
 
     Args:
         experiment_id (str): The experiment's id, as submit() and the ledger record it.
@@ -185,7 +204,92 @@ def fetch(experiment_id: str, directory: Path, client: RobotariumClient = None,
             _download(result, directory / folder / name, force, out,
                       lambda sink, file_id=file_id: client.download_file(file_id, file_type,
                                                                          sink))
+    _recover(result, force, out)
     return result
+
+
+def run_copies(text: str) -> tuple:
+    """
+    The RunLogger files a run's output holds copies of.
+
+    Returns:
+        (found, damaged): found maps each file's name to the bytes of its last complete copy
+        (a logger that autosaves prints one per write); damaged lists the names whose last
+        copy is cut short or does not match its size and checksum.
+    """
+    found, damaged = {}, []
+    current = None
+    for line in text.splitlines():
+        line = line.strip()
+        begun = COPY_BEGIN.match(line)
+        if current and (begun or line == COPY_END % current[0]):
+            name, size, digest, lines = current
+            content = None if begun else _decoded(lines, size, digest)
+            if content is None:
+                damaged.append(name)
+            else:
+                found[name] = content
+                damaged = [each for each in damaged if each != name]
+            current = None
+        if begun:
+            current = (begun.group(1), int(begun.group(2)), begun.group(3), [])
+        elif current and BASE64_LINE.match(line):
+            current[3].append(line)
+        # Any other line inside a copy is someone else's output, printed meanwhile; the
+        # checksum says whether the copy survived it.
+    if current:
+        damaged.append(current[0])
+    return found, list(dict.fromkeys(damaged))
+
+
+def _decoded(lines: list, size: int, digest: str):
+    """A copy's bytes, or None when they are not what its first line says."""
+    try:
+        content = base64.b64decode("".join(lines), validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    if len(content) != size or hashlib.sha256(content).hexdigest() != digest:
+        return None
+    return content
+
+
+def _recover(result: FetchResult, force: bool, out) -> None:
+    """
+    Writes into data/ the RunLogger files the run printed into its log files. A data file the
+    site returned under the same name is the one kept.
+    """
+    logs, data = result.directory / "logs", result.directory / "data"
+    fetched = result.written + result.kept
+    returned = {path.name.lower() for path in fetched if path.parent == data}
+    for log_file in sorted(path for path in fetched if path.parent == logs):
+        found, damaged = run_copies(log_file.read_text(encoding="utf-8", errors="replace"))
+        found = {_safe_name(name, "run.npz", set()): content for name, content in found.items()}
+        source = log_file.relative_to(result.directory)
+        for name in damaged:
+            name = _safe_name(name, "run.npz", set())
+            result.damaged.append(
+                "The last copy of %s in %s is incomplete (the run may have been stopped while "
+                "printing it); %s" % (name, source, "data/%s is the one before it." % name
+                                      if name in found else "there is no complete one."))
+        for name, content in found.items():
+            if name.lower() in returned:
+                continue
+            target = data / name
+            result.recovered[target] = log_file
+            if target.exists() and not force:
+                result.kept.append(target)
+                continue
+            out("  copying %s out of %s ..." % (target.relative_to(result.directory), source))
+            data.mkdir(parents=True, exist_ok=True)
+            partial = target.with_name(target.name + ".part")
+            try:
+                partial.write_bytes(content)
+                partial.replace(target)
+            finally:
+                partial.unlink(missing_ok=True)
+            result.written.append(target)
+    if result.recovered and "data files" in result.missing:
+        result.missing.remove("data files")
 
 
 def describe(result: FetchResult) -> str:
@@ -201,10 +305,13 @@ def describe(result: FetchResult) -> str:
         if experiment.get(key):
             lines.append("  %-10s %s" % (label, experiment[key]))
     lines.append("")
-    for path in result.written:
-        lines.append("  wrote   %s" % path)
-    for path in result.kept:
-        lines.append("  kept    %s" % path)
+    for verb, paths in (("wrote", result.written), ("kept", result.kept)):
+        for path in paths:
+            source = result.recovered.get(path)
+            lines.append("  %-7s %s%s" % (verb, path, " (copied out of %s)" % source.name
+                                          if source else ""))
+    for sentence in result.damaged:
+        lines.append("  %s" % sentence)
     if result.missing:
         lines.append("  %s: %s" % ("nothing came back for" if result.finished
                                    else "not available yet", ", ".join(result.missing)))

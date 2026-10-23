@@ -17,7 +17,10 @@ the bundle.
 
 import ast
 import atexit
+import base64
 import datetime
+import hashlib
+import io
 import json
 import os
 import platform
@@ -35,9 +38,14 @@ __version__ = "0.1.0"
 STEP_SECONDS = 0.033
 
 #: Where RunLogger writes when no directory is given: `robotarium simulate` points it at
-#: .robotarium/runs/ so local runs do not litter the bundle. Unset on the testbed, where the
-#: main file's own directory is what gets returned.
+#: .robotarium/runs/ so local runs do not litter the bundle. Unset on the testbed, where it
+#: writes beside the main file.
 LOG_DIR_VARIABLE = "ROBOTARIUM_LOG_DIR"
+
+#: The lines RunLogger prints a copy of its file between: the file's name, its size in bytes
+#: and its SHA-256, then the file in base64, then the end line. robotarium.results reads them.
+COPY_BEGIN = "-----BEGIN ROBOTARIUM RUN %s %d %s-----"
+COPY_END = "-----END ROBOTARIUM RUN %s-----"
 
 
 # ---------------------------------------------------------------------------
@@ -333,9 +341,12 @@ class RunLogger:
             log.record(poses=x, velocities=dxu)
         log.save()
 
-    On the testbed it writes beside the main file, which is what comes back with the results.
-    `autosave_every` rewrites the file every that many records, so a run the testbed stops at
-    its declared duration still leaves its data; it is also written when the interpreter exits.
+    On the testbed it writes beside the main file, but so far the testbed has returned none of
+    the files a run writes, only what it prints (log.txt): hans-riess/robotarium#7. So each
+    write is also printed, base64-encoded between marker lines, and `robotarium fetch` turns it
+    back into the .npz. `autosave_every` rewrites the file every that many records, so a run the
+    testbed stops at its declared duration still leaves its data; it is also written when the
+    interpreter exits.
 
     Args:
         name (str): The file name's stem; the start time is appended.
@@ -344,10 +355,12 @@ class RunLogger:
         autosave_every (int): Rewrite the file every this many record() calls; 0 for never.
         save_at_exit (bool): Write the file when the interpreter exits, if it has changed.
         echo (bool): Print notes as well as keeping them.
+        stdout_copy (bool): Print a copy of the file each time it is written; default when
+            stdout is not a terminal, as on the testbed and in `robotarium simulate`.
     """
 
     def __init__(self, name="run", directory=None, meta=None, autosave_every=0,
-                 save_at_exit=True, echo=True):
+                 save_at_exit=True, echo=True, stdout_copy=None):
         self.started = datetime.datetime.now().astimezone()
         directory = Path(directory or os.environ.get(LOG_DIR_VARIABLE) or here())
         stem = "%s_%s" % (name, self.started.strftime("%Y%m%d_%H%M%S"))
@@ -360,6 +373,7 @@ class RunLogger:
         _CLAIMED.add(self.path.resolve())
         self.autosave_every = int(autosave_every)
         self.echo = echo
+        self.stdout_copy = stdout_copy
         self._series = {}
         self._steps = {}
         self._next_step = 0
@@ -436,7 +450,10 @@ class RunLogger:
             print("[step %d | %.2f s] %s" % (step, step * STEP_SECONDS, message), flush=True)
 
     def save(self) -> Path:
-        """Writes everything recorded so far, replacing the previous write, and returns where."""
+        """
+        Writes everything recorded so far, replacing the previous write, and returns where. With
+        stdout_copy, prints the file first, so a write that fails still leaves the copy.
+        """
         arrays = {}
         for key, series in self._series.items():
             arrays[key] = np.stack(series)
@@ -444,13 +461,18 @@ class RunLogger:
         meta = dict(self.meta, saved_at=datetime.datetime.now().astimezone().isoformat(
             timespec="seconds"), records=self._records)
         arrays["__meta__"] = np.array(json.dumps(meta, default=_jsonable))
+        buffer = io.BytesIO()
+        np.savez_compressed(buffer, **arrays)
+        content = buffer.getvalue()
+        if self._copies_to_stdout():
+            self._print_copy(content)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # Written aside and moved into place, so a run killed mid-write leaves the last
         # complete file rather than a truncated one.
         partial = self.path.with_name(self.path.name + ".partial")
         try:
             with open(partial, "wb") as handle:
-                np.savez_compressed(handle, **arrays)
+                handle.write(content)
             os.replace(partial, self.path)
         except BaseException:
             try:
@@ -460,6 +482,21 @@ class RunLogger:
             raise
         self._dirty = False
         return self.path
+
+    def _copies_to_stdout(self) -> bool:
+        if self.stdout_copy is not None:
+            return bool(self.stdout_copy)
+        try:
+            return not sys.stdout.isatty()
+        except (AttributeError, ValueError):  # no stdout (pythonw), or a closed one
+            return False
+
+    def _print_copy(self, content: bytes) -> None:
+        """The file as text, in one write so that nothing else lands inside it."""
+        sys.stdout.write("%s\n%s%s\n" % (
+            COPY_BEGIN % (self.path.name, len(content), hashlib.sha256(content).hexdigest()),
+            base64.encodebytes(content).decode("ascii"), COPY_END % self.path.name))
+        sys.stdout.flush()
 
     def _save_if_dirty(self) -> None:
         if self._dirty:
