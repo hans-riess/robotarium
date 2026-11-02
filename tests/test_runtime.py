@@ -28,7 +28,9 @@ def test_a_run_is_recorded_and_read_back(tmp_path, fresh_runtime):
     assert run.data["poses"][4, 0, 0] == 4
     assert list(run.steps["error"]) == [0, 1, 2, 3, 4]
     assert run.meta["seed"] == 3 and run.meta["records"] == 5
+    wall = run.meta["notes"][0].pop("wall")
     assert run.meta["notes"] == [{"step": 2, "seconds": 0.066, "message": "halfway"}]
+    assert isinstance(wall, float) and wall >= 0
     assert not path.with_name(path.name + ".partial").exists()
 
 
@@ -280,3 +282,194 @@ def test_a_write_that_fails_still_leaves_the_copy(tmp_path, fresh_runtime, monke
         log.save()
     assert list(run_copies(capsys.readouterr().out)[0]) == [log.path.name]
     assert list(tmp_path.iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
+# RunLogger: float32, copy_every, wall time
+# ---------------------------------------------------------------------------
+
+def test_dtype_keeps_floats_in_float32_and_leaves_the_rest(tmp_path, fresh_runtime):
+    log = fresh_runtime.RunLogger(directory=tmp_path, save_at_exit=False, dtype="float32")
+    log.record(poses=np.ones((3, 2)), step_count=np.int64(4), label="a", flag=True)
+    run = fresh_runtime.load_run(log.save())
+    assert run.data["poses"].dtype == np.float32
+    assert run.data["step_count"].dtype == np.int64
+    assert run.data["flag"].dtype == bool and run.data["label"][0] == "a"
+
+
+def test_dtype_must_be_a_floating_type(tmp_path, fresh_runtime):
+    with pytest.raises(ValueError, match="floating"):
+        fresh_runtime.RunLogger(directory=tmp_path, save_at_exit=False, dtype="int32")
+
+
+def test_copy_every_prints_every_nth_write_and_the_last(tmp_path, fresh_runtime, capsys):
+    log = fresh_runtime.RunLogger("demo", directory=tmp_path, autosave_every=1, copy_every=3,
+                                  save_at_exit=False, echo=False, stdout_copy=True)
+    for step in range(7):
+        log.record(x=step)
+    begin = "-----BEGIN ROBOTARIUM RUN %s " % log.path.name
+    assert capsys.readouterr().out.count(begin) == 2          # writes 3 and 6
+    log._save_if_dirty()                                       # at exit: write 7 is unprinted
+    out = capsys.readouterr().out
+    assert out.count(begin) == 1
+    found, _ = run_copies(out)
+    assert fresh_runtime.load_run(io.BytesIO(found[log.path.name])).data["x"].tolist() == \
+        list(range(7))
+    log._save_if_dirty()                                       # nothing new: nothing printed
+    assert capsys.readouterr().out == ""
+    log.save(final=True)
+    assert capsys.readouterr().out.count(begin) == 1
+
+
+def test_a_note_keeps_the_wall_time_since_import(tmp_path, fresh_runtime, monkeypatch):
+    monkeypatch.setattr(fresh_runtime, "_IMPORTED", fresh_runtime.time.monotonic() - 100.0)
+    log = fresh_runtime.RunLogger(directory=tmp_path, save_at_exit=False, echo=False)
+    log.note("now")
+    assert 100.0 <= log.meta["notes"][0]["wall"] < 160.0
+
+
+# ---------------------------------------------------------------------------
+# Julia timings
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def no_timings(fresh_runtime, monkeypatch):
+    monkeypatch.setattr(fresh_runtime, "_TIMINGS", {})
+    monkeypatch.setattr(fresh_runtime, "_TIMING_PRINTED", [None])
+    return fresh_runtime
+
+
+def test_loading_the_backend_is_timed_and_printed(tmp_path, monkeypatch, fake_julia,
+                                                  no_timings, capsys):
+    runtime = no_timings
+    assert runtime.julia_timings() == {}
+    write(tmp_path / "backend.jl", "module Backend\nend\n")
+    monkeypatch.setattr(runtime, "here", lambda: tmp_path)
+    packages = [("JSON3", "0f8b85d8-7281-11e9-16c2-39a750bddbf1", "1")]
+    backend = runtime.load_julia_backend("backend.jl", packages=packages,
+                                         julia_version="=1.11.9")
+    timings = runtime.julia_timings()
+    for name in ("resolve_seconds", "start_seconds", "include_seconds", "total_seconds",
+                 "loaded_at"):
+        assert timings[name] >= 0
+    assert timings["first_calls"] == {}
+    assert timings["key"] == runtime.julia_key("=1.11.9", packages, timings["juliacall"],
+                                               timings["juliapkg"])
+    out = capsys.readouterr().out
+    marker = [line for line in out.splitlines() if line.startswith("-----ROBOTARIUM TIMING ")]
+    assert len(marker) == 1 and json.loads(marker[0][23:-5])["key"] == timings["key"]
+    assert "robotarium_runtime: Julia" in out
+
+    runtime.call_json(backend.build, {"n": 1})
+    runtime.call_json(backend.build, {"n": 2})
+    assert list(runtime.julia_timings()["first_calls"]) == ["<lambda>"]
+
+    # The first save prints the timings again, now with the first calls, and keeps them.
+    log = runtime.RunLogger(directory=tmp_path, save_at_exit=False, stdout_copy=False)
+    log.record(x=1)
+    run = runtime.load_run(log.save())
+    assert run.meta["julia"]["first_calls"] == {"<lambda>": pytest.approx(0, abs=1)}
+    assert capsys.readouterr().out.count("-----ROBOTARIUM TIMING ") == 1
+    log.save()
+    assert "ROBOTARIUM TIMING" not in capsys.readouterr().out
+
+
+def test_the_key_depends_on_what_is_installed(no_timings):
+    key = no_timings.julia_key
+    packages = [{"name": "JSON3", "uuid": "u", "version": "1"}]
+    assert key("=1.11.9", packages, "0.9.35", "0.1.24") == \
+        key("=1.11.9", [("JSON3", "u", "1")], "0.9.35", "0.1.24")
+    assert key("=1.11.9", packages, "0.9.35", "0.1.24") != \
+        key("=1.11.8", packages, "0.9.35", "0.1.24")
+    assert key("=1.11.9", packages, "0.9.35", "0.1.24") != \
+        key("=1.11.9", packages + [("Graphs", "g", None)], "0.9.35", "0.1.24")
+    assert key("=1.11.9", packages, "0.9.35", "0.1.24") != \
+        key("=1.11.9", packages, "0.9.36", "0.1.24")
+
+
+# ---------------------------------------------------------------------------
+# FloorOverlay
+# ---------------------------------------------------------------------------
+
+def test_an_overlay_without_a_figure_does_nothing_and_imports_no_matplotlib(tmp_path):
+    import subprocess
+    script = (
+        "import sys, types\n"
+        "import robotarium_runtime as runtime\n"
+        "overlay = runtime.FloorOverlay(types.SimpleNamespace(_axes_handle=None))\n"
+        "overlay.segment('a', (0, 0), (1, 1)); overlay.ring('b', (0, 0), 0.1)\n"
+        "overlay.arrow('c', (0, 0), (1, 0)); overlay.clock(1.0, label='x'); overlay.clear()\n"
+        "print(overlay.enabled, overlay.keys(), 'matplotlib' in sys.modules)\n")
+    out = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                         check=True).stdout
+    assert out.strip() == "False [] False"
+
+
+@pytest.fixture
+def arena():
+    """A figure laid out as rps lays its own out, without the simulator."""
+    matplotlib = pytest.importorskip("matplotlib")
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    figure, axes = plt.subplots(figsize=(8.25, 5.25))
+    axes.set_xlim(-1.65, 1.65)
+    axes.set_ylim(-1.05, 1.05)
+    axes.set_aspect("equal")
+    yield types.SimpleNamespace(_fig=figure, _axes_handle=axes)
+    plt.close(figure)
+
+
+def test_an_overlay_updates_its_artists_in_place(arena, fresh_runtime):
+    overlay = fresh_runtime.FloorOverlay(arena)
+    assert overlay.enabled and overlay.figure is arena._fig
+    for step in range(3):
+        x = np.array([[0.1 * step, 0.5], [0.0, 0.2], [0.0, 1.0]])
+        overlay.segment("link", x[:, 0], x[:, 1], color="#c03030", style="--")
+        overlay.polyline("path", np.array([[0, 1, 1], [0, 0, 1]]), closed=True)
+        overlay.ring("slot", x[:, 1], 0.08)
+        overlay.dot("goal", (0.3, 0.3), filled=False)
+        overlay.arrow("heading", x[:, 0], (0.2, 0.1 * step))
+        overlay.text("label", (0.5, 0.5), "step %d" % step)
+        overlay.clock(step * 0.033, label="assembling")
+        if step == 0:
+            first = {key: overlay._artists[key] for key in overlay.keys()}
+    assert {key: overlay._artists[key] for key in overlay.keys()} == first
+    assert overlay.keys() == ["link", "path", "slot", "goal", "heading", "label", "__clock__"]
+    assert len(arena._axes_handle.lines) == 2
+    assert list(first["link"].get_xdata()) == [0.2, 0.5]
+    assert first["link"].get_linestyle() == "--"
+    assert list(first["path"].get_xdata()) == [0, 1, 1, 0]
+    assert first["slot"].get_center() == (0.5, 0.2) and not first["slot"].get_fill()
+    assert first["__clock__"].get_text() == "t = 0.1 s  assembling"
+    assert first["label"].get_text() == "step 2"
+    arena._fig.canvas.draw()
+
+
+def test_a_zero_arrow_hides_and_keys_can_be_hidden_and_removed(arena, fresh_runtime):
+    overlay = fresh_runtime.FloorOverlay(arena)
+    overlay.arrow("a", (0, 0), (0.2, 0))
+    overlay.arrow("a", (0, 0), (0, 0))
+    assert not overlay._artists["a"].get_visible()
+    overlay.arrow("a", (0, 0), (0.1, 0.1))
+    assert overlay._artists["a"].get_visible()
+    overlay.ring("r1", (0, 0), 0.1)
+    overlay.ring("r2", (0, 0), 0.2)
+    overlay.hide("r1")
+    assert not overlay._artists["r1"].get_visible()
+    overlay.show("r1")
+    assert overlay._artists["r1"].get_visible()
+    overlay.clear("r")
+    assert overlay.keys() == ["a"]
+    overlay.remove("a")
+    overlay.hide("never drawn")
+    assert overlay.keys() == [] and len(arena._axes_handle.patches) == 0
+
+
+def test_a_drawing_error_turns_the_overlay_off_without_failing_the_run(arena, fresh_runtime,
+                                                                        capsys):
+    overlay = fresh_runtime.FloorOverlay(arena)
+    overlay.segment("bad", (1,), (2, 3))
+    assert not overlay.enabled and isinstance(overlay.error, ValueError)
+    assert "FloorOverlay is off" in capsys.readouterr().out
+    overlay.segment("fine", (0, 0), (1, 1))
+    assert overlay.keys() == []

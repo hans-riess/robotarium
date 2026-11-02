@@ -1,8 +1,9 @@
 """
 Helpers that travel WITH an experiment to the Robotarium: loading a Julia backend, logging a run,
-recording a local video, and reading what the bundle was built with.
+drawing on the arena figure, recording a local video, and reading what the bundle was built
+with.
 
-    from robotarium_runtime import RunLogger, load_julia_backend, config
+    from robotarium_runtime import FloorOverlay, RunLogger, load_julia_backend, config
 
 The testbed has none of the `robotarium` package installed, so this one file is copied into
 every bundle whose .py files import it (`robotarium bundle` does that), and it is uploaded as a
@@ -28,6 +29,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -46,6 +48,13 @@ LOG_DIR_VARIABLE = "ROBOTARIUM_LOG_DIR"
 #: and its SHA-256, then the file in base64, then the end line. robotarium.results reads them.
 COPY_BEGIN = "-----BEGIN ROBOTARIUM RUN %s %d %s-----"
 COPY_END = "-----END ROBOTARIUM RUN %s-----"
+
+#: The line julia timings are printed on, as compact JSON; robotarium.results reads it out of
+#: log.txt into julia_timing.json.
+TIMING_MARKER = "-----ROBOTARIUM TIMING %s-----"
+
+#: When this module was imported: the zero of each note's "wall" time and of the timings.
+_IMPORTED = time.monotonic()
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +182,80 @@ class JuliaBackendError(RuntimeError):
 _DECLARED = set()
 _BACKENDS = {}
 
+#: What loading the backend took, filled in as it happens; see julia_timings().
+_TIMINGS = {}
+_TIMING_PRINTED = [None]
+
+
+def julia_timings() -> dict:
+    """
+    How long each step of starting the Julia backend took in this process, in seconds:
+
+        {"resolve_seconds": ..., "start_seconds": ..., "include_seconds": ...,
+         "first_calls": {"build_operators": ...}, "total_seconds": ...,
+         "julia_version": "1.11.9", "juliacall": "0.9.35", "juliapkg": "0.1.24",
+         "key": "<sha256>", "loaded_at": ...}
+
+    resolve is juliapkg installing Julia and the packages (minutes the first time, on the
+    testbed every time); start is juliacall starting Julia; include is the .jl file loading
+    its packages; first_calls are each function's first call_json, which compiles it.
+    total_seconds is their sum: what the run spends on Julia before its robots can move.
+    loaded_at is when the backend was ready, in seconds since this module was imported. key
+    identifies the Julia version, packages and juliacall/juliapkg versions it was measured
+    with (see julia_key). Empty when no backend was loaded.
+    """
+    if not _TIMINGS:
+        return {}
+    timings = dict(_TIMINGS)
+    timings["first_calls"] = dict(_TIMINGS.get("first_calls") or {})
+    timings["total_seconds"] = round(sum(timings.get(name) or 0.0 for name in (
+        "resolve_seconds", "start_seconds", "include_seconds"))
+        + sum(timings["first_calls"].values()), 3)
+    return timings
+
+
+def julia_key(julia_version, packages, juliacall_version, juliapkg_version) -> str:
+    """
+    What a Julia startup time depends on, as a sha256: the [julia] version specifier, the
+    packages (name, uuid, version), and the juliacall and juliapkg versions. A timing is only
+    compared with a project that has the same key.
+    """
+    entries = sorted(_package_entry(each) for each in packages or ())
+    text = json.dumps({"julia": None if julia_version is None else str(julia_version),
+                       "packages": [list(each) for each in entries],
+                       "juliacall": juliacall_version, "juliapkg": juliapkg_version},
+                      sort_keys=True)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _distribution_version(name):
+    try:
+        from importlib import metadata
+        return metadata.version(name)
+    except Exception:  # noqa: BLE001 -- not installed, or a stand-in with no metadata
+        module = sys.modules.get(name)
+        return getattr(module, "__version__", None)
+
+
+def _print_timing() -> None:
+    """The human-readable line and the marker, when the timings changed since last printed."""
+    timings = julia_timings()
+    if not timings:
+        return
+    text = json.dumps(timings, sort_keys=True, separators=(",", ":"))
+    if text == _TIMING_PRINTED[0]:
+        return
+    _TIMING_PRINTED[0] = text
+    calls = timings["first_calls"]
+    print("robotarium_runtime: Julia %s: packages %.1f s, start %.1f s, include %.1f s%s; "
+          "%.1f s in all" % (
+              timings.get("julia_version") or "?", timings.get("resolve_seconds") or 0.0,
+              timings.get("start_seconds") or 0.0, timings.get("include_seconds") or 0.0,
+              "".join(", first %s() %.1f s" % (name, seconds)
+                      for name, seconds in calls.items()), timings["total_seconds"]),
+          flush=True)
+    print(TIMING_MARKER % text, flush=True)
+
 
 def declare_julia_packages(packages, julia_version=None) -> None:
     """
@@ -216,6 +299,7 @@ def declare_julia_packages(packages, julia_version=None) -> None:
         else:
             juliapkg.add(name, uuid)
 
+    started = time.monotonic()
     try:
         juliapkg.resolve()
     except Exception as error:
@@ -223,6 +307,9 @@ def declare_julia_packages(packages, julia_version=None) -> None:
             "Could not install the Julia packages %s. Check each name, UUID and version; on "
             "the testbed, the cause can also be that it could not reach the package servers."
             % ", ".join(name for name, _, _ in entries)) from error
+    finally:
+        _TIMINGS["resolve_seconds"] = round(
+            (_TIMINGS.get("resolve_seconds") or 0.0) + time.monotonic() - started, 3)
     _DECLARED.update(pending)
 
 
@@ -257,10 +344,16 @@ def load_julia_backend(path="backend.jl", module=None, packages=None, julia_vers
         packages = declared.get("packages") or ()
     if julia_version is None:
         julia_version = declared.get("version")
+    _TIMINGS.setdefault("first_calls", {})
     declare_julia_packages(packages, julia_version)
 
+    starting = "juliacall" not in sys.modules
+    started = time.monotonic()
     from juliacall import Main as jl
+    if starting:
+        _TIMINGS["start_seconds"] = round(time.monotonic() - started, 3)
 
+    started = time.monotonic()
     try:
         jl.include(str(path))
     except Exception as error:
@@ -268,12 +361,33 @@ def load_julia_backend(path="backend.jl", module=None, packages=None, julia_vers
             "Julia could not load %s: %s. If it says a package is missing, declare it under "
             "[julia] packages in robotarium.toml (or pass packages=)." % (path.name, error)
         ) from error
+    finally:
+        _TIMINGS["include_seconds"] = round(
+            (_TIMINGS.get("include_seconds") or 0.0) + time.monotonic() - started, 3)
 
     if module is None:
         module = julia_module_name(path.read_text(encoding="utf-8"))
     backend = getattr(jl, module) if module else jl
     _BACKENDS[path] = backend
+
+    juliacall_version = _distribution_version("juliacall")
+    juliapkg_version = _distribution_version("juliapkg")
+    _TIMINGS.update(
+        julia_version=_julia_version(jl), juliacall=juliacall_version, juliapkg=juliapkg_version,
+        julia_requested=None if julia_version is None else str(julia_version),
+        packages=[list(_package_entry(each)) for each in packages or ()],
+        key=julia_key(julia_version, packages, juliacall_version, juliapkg_version),
+        loaded_at=round(time.monotonic() - _IMPORTED, 3), cpus=os.cpu_count(),
+        platform=platform.platform())
+    _print_timing()
     return backend
+
+
+def _julia_version(jl):
+    try:
+        return str(jl.seval("string(VERSION)"))
+    except Exception:  # noqa: BLE001 -- a Main without seval: a stand-in, or an old juliacall
+        return None
 
 
 def julia_module_name(source: str):
@@ -291,7 +405,28 @@ def call_json(function, payload):
         function: A Julia function, e.g. backend.build_operators.
         payload: Anything json.dumps takes; numpy arrays are converted to lists.
     """
-    return function(json.dumps(payload, default=_jsonable))
+    text = json.dumps(payload, default=_jsonable)
+    calls = _TIMINGS.get("first_calls")
+    if calls is None:
+        return function(text)
+    name = _function_name(function)
+    if name in calls:
+        return function(text)
+    started = time.monotonic()
+    try:
+        return function(text)
+    finally:
+        calls[name] = round(time.monotonic() - started, 3)
+
+
+def _function_name(function) -> str:
+    """A Julia function's name, as juliacall shows it; a Python one's __name__."""
+    if type(function).__module__.startswith("juliacall"):
+        try:
+            return str(function)
+        except Exception:  # noqa: BLE001
+            pass
+    return str(getattr(function, "__name__", None) or function)
 
 
 def as_arrays(result, names, dtype=float) -> dict:
@@ -346,7 +481,9 @@ class RunLogger:
     write is also printed, base64-encoded between marker lines, and `robotarium fetch` turns it
     back into the .npz. `autosave_every` rewrites the file every that many records, so a run the
     testbed stops at its declared duration still leaves its data; it is also written when the
-    interpreter exits.
+    interpreter exits. Every write prints the whole file again, so a long run that autosaves
+    often fills log.txt with copies: `copy_every` prints only every that many writes (and the
+    last), and `dtype="float32"` halves what floats take.
 
     Args:
         name (str): The file name's stem; the start time is appended.
@@ -357,10 +494,15 @@ class RunLogger:
         echo (bool): Print notes as well as keeping them.
         stdout_copy (bool): Print a copy of the file each time it is written; default when
             stdout is not a terminal, as on the testbed and in `robotarium simulate`.
+        dtype: A floating dtype, such as "float32", to store every floating-point value in;
+            integers, booleans and text are kept as they are. None keeps each as recorded.
+        copy_every (int): With stdout_copy, print the copy on every this many writes only. The
+            write at exit, and save(final=True), always print it, so the last copy in log.txt
+            is the whole run.
     """
 
     def __init__(self, name="run", directory=None, meta=None, autosave_every=0,
-                 save_at_exit=True, echo=True, stdout_copy=None):
+                 save_at_exit=True, echo=True, stdout_copy=None, dtype=None, copy_every=1):
         self.started = datetime.datetime.now().astimezone()
         directory = Path(directory or os.environ.get(LOG_DIR_VARIABLE) or here())
         stem = "%s_%s" % (name, self.started.strftime("%Y%m%d_%H%M%S"))
@@ -374,6 +516,15 @@ class RunLogger:
         self.autosave_every = int(autosave_every)
         self.echo = echo
         self.stdout_copy = stdout_copy
+        self.dtype = None
+        if dtype is not None:
+            self.dtype = np.dtype(dtype)
+            if self.dtype.kind != "f":
+                raise ValueError("RunLogger: dtype must be a floating type such as \"float32\", "
+                                 "not %s." % self.dtype)
+        self.copy_every = max(1, int(copy_every))
+        self._saves = 0
+        self._copy_pending = False
         self._series = {}
         self._steps = {}
         self._next_step = 0
@@ -399,6 +550,9 @@ class RunLogger:
         """
         step = self._next_step if step is None else int(step)
         arrays = {key: np.array(value, copy=True) for key, value in values.items()}
+        if self.dtype is not None:
+            arrays = {key: array.astype(self.dtype) if array.dtype.kind == "f" else array
+                      for key, array in arrays.items()}
         # Every value is checked before any is kept, so a refused record leaves no series a
         # step longer than the others.
         for key, array in arrays.items():
@@ -439,20 +593,27 @@ class RunLogger:
         Args:
             message (str): The remark.
             step (int): The step it is about; default the last one recorded (0 before any).
+
+        Each note also keeps "wall", the seconds since robotarium_runtime was imported, which
+        places it in the testbed's video and log.txt (Julia's startup comes first).
         """
         if step is None:
             step = 0 if self._last_step is None else self._last_step
         step = int(step)
         self.meta["notes"].append({"step": step, "seconds": round(step * STEP_SECONDS, 3),
-                                   "message": str(message)})
+                                   "message": str(message),
+                                   "wall": round(time.monotonic() - _IMPORTED, 3)})
         self._dirty = True
         if self.echo:
             print("[step %d | %.2f s] %s" % (step, step * STEP_SECONDS, message), flush=True)
 
-    def save(self) -> Path:
+    def save(self, final=False) -> Path:
         """
         Writes everything recorded so far, replacing the previous write, and returns where. With
         stdout_copy, prints the file first, so a write that fails still leaves the copy.
+
+        Args:
+            final (bool): Print the copy whatever copy_every says, as the write at exit does.
         """
         arrays = {}
         for key, series in self._series.items():
@@ -460,12 +621,22 @@ class RunLogger:
             arrays["__steps__" + key] = np.asarray(self._steps[key], dtype=np.int64)
         meta = dict(self.meta, saved_at=datetime.datetime.now().astimezone().isoformat(
             timespec="seconds"), records=self._records)
+        timings = julia_timings()
+        if timings and "julia" not in self.meta:
+            meta["julia"] = timings
         arrays["__meta__"] = np.array(json.dumps(meta, default=_jsonable))
         buffer = io.BytesIO()
         np.savez_compressed(buffer, **arrays)
         content = buffer.getvalue()
+        # The first calls to the backend have happened by now, and log.txt should have them.
+        _print_timing()
+        self._saves += 1
         if self._copies_to_stdout():
-            self._print_copy(content)
+            if final or self._saves % self.copy_every == 0:
+                self._print_copy(content)
+                self._copy_pending = False
+            else:
+                self._copy_pending = True
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # Written aside and moved into place, so a run killed mid-write leaves the last
         # complete file rather than a truncated one.
@@ -499,9 +670,10 @@ class RunLogger:
         sys.stdout.flush()
 
     def _save_if_dirty(self) -> None:
-        if self._dirty:
+        # A write whose copy copy_every held back is written again, to print it.
+        if self._dirty or self._copy_pending:
             try:
-                print("Run log: %s" % self.save(), flush=True)
+                print("Run log: %s" % self.save(final=True), flush=True)
             except Exception as error:  # noqa: BLE001 -- at exit, report rather than raise
                 print("robotarium_runtime: the run log could not be written: %s" % error)
 
@@ -545,6 +717,260 @@ def _jsonable(value):
     if isinstance(value, Path):
         return str(value)
     raise TypeError("%r is not JSON-serialisable" % (value,))
+
+
+# ---------------------------------------------------------------------------
+# drawing on the arena
+# ---------------------------------------------------------------------------
+
+def _guarded(method):
+    """
+    A FloorOverlay method that does nothing when the overlay is off, and that turns the overlay
+    off, with one printed line, rather than fail the run when drawing does. On the testbed the
+    figure may be projected onto the floor; a drawing error must not stop the robots.
+    """
+    def wrapped(self, *args, **kwargs):
+        if not self.enabled:
+            return None
+        try:
+            return method(self, *args, **kwargs)
+        except Exception as error:  # noqa: BLE001 -- see above
+            self.enabled = False
+            self.error = error
+            print("robotarium_runtime: FloorOverlay is off after an error in %s(): %s: %s"
+                  % (method.__name__, type(error).__name__, error), flush=True)
+            return None
+    wrapped.__name__ = method.__name__
+    wrapped.__doc__ = method.__doc__
+    return wrapped
+
+
+def _point(value) -> tuple:
+    """A point as (x, y): a length-2 sequence, or the first two entries of a pose."""
+    array = np.asarray(value, dtype=float).reshape(-1)
+    if array.size < 2:
+        raise ValueError("a point needs x and y, not %r" % (value,))
+    return float(array[0]), float(array[1])
+
+
+def _points(value) -> tuple:
+    """A 2 x N (or 3 x N poses) array as (xs, ys)."""
+    array = np.asarray(value, dtype=float)
+    if array.ndim != 2 or array.shape[0] < 2:
+        raise ValueError("points must be a 2 x N array, not shape %s" % (array.shape,))
+    return array[0].tolist(), array[1].tolist()
+
+
+class FloorOverlay:
+    """
+    Draws on the simulator's arena figure: links between robots, rails, rings, arrows, labels
+    and a run clock, in metres in the arena frame, updated in place from step to step.
+
+        overlay = FloorOverlay(r)
+        for t in range(iterations):
+            x = r.get_poses()
+            overlay.segment("link12", x[:, 0], x[:, 1], color="#c03030")
+            overlay.ring("slot1", goal[:, 0], 0.08, style="--")
+            overlay.clock(t * STEP_SECONDS, label="assembling")
+            ...
+            r.step()           # rps redraws the figure; the overlay never does
+
+    Each drawing method takes a key. Its first call creates the artist; later calls with the
+    same key move or restyle that artist, never a new one, so a loop of 4,000 steps keeps a
+    handful of artists. hide(), show(), remove() and clear() act on keys.
+
+    The figure is rps's: the axes r._axes_handle (or r.axes), the figure r._fig (or r.figure).
+    Without them (show_figure=False, and the testbed unless it draws one) `enabled` is False,
+    every method does nothing, and Matplotlib is never imported. An error while drawing turns
+    the overlay off with one printed line instead of failing the run.
+
+    On a projected floor, rings and dots read at their size in metres, so give them real
+    sizes (a robot is about 0.11 m across); an unfilled ring hides less of the robot under it
+    than a filled disc.
+
+    Args:
+        r: The Robotarium.
+        zorder (float): Where the overlay sits: rps draws its robots at 2, so 4 draws on top.
+    """
+
+    def __init__(self, r, zorder=4):
+        axes = getattr(r, "_axes_handle", None)
+        if axes is None:
+            axes = getattr(r, "axes", None)
+        if axes is not None and not hasattr(axes, "add_patch"):
+            axes = None
+        figure = getattr(r, "_fig", None)
+        if figure is None:
+            figure = getattr(r, "figure", None)
+        if figure is None and axes is not None:
+            figure = getattr(axes, "figure", None)
+        self.axes = axes
+        self.figure = figure
+        self.zorder = zorder
+        self.enabled = axes is not None
+        self.error = None
+        self._artists = {}
+
+    # -- lines ------------------------------------------------------------------------------
+
+    @_guarded
+    def segment(self, key, p, q, color="#1f3b73", width=2.0, style="-", alpha=1.0):
+        """A straight line from the point p to the point q."""
+        (x0, y0), (x1, y1) = _point(p), _point(q)
+        self._line(key, [x0, x1], [y0, y1], color, width, style, alpha)
+
+    @_guarded
+    def polyline(self, key, points, color="#1f3b73", width=1.5, style="-", alpha=1.0,
+                 closed=False):
+        """A path through the columns of a 2 x N array; closed joins the last to the first."""
+        xs, ys = _points(points)
+        if closed and xs:
+            xs, ys = xs + xs[:1], ys + ys[:1]
+        self._line(key, xs, ys, color, width, style, alpha)
+
+    def _line(self, key, xs, ys, color, width, style, alpha):
+        line = self._artists.get(key)
+        if line is None:
+            line, = self.axes.plot(xs, ys, color=color, linewidth=width, linestyle=style,
+                                   alpha=alpha, solid_capstyle="round", zorder=self.zorder)
+            self._artists[key] = line
+            return
+        line.set_data(xs, ys)
+        line.set_color(color)
+        line.set_linewidth(width)
+        line.set_linestyle(style)
+        line.set_alpha(alpha)
+
+    # -- circles ----------------------------------------------------------------------------
+
+    @_guarded
+    def ring(self, key, center, radius, color="#1f3b73", width=2.0, style="-", alpha=1.0):
+        """An unfilled circle of `radius` metres."""
+        self._circle(key, center, radius, color, alpha, False, width, style)
+
+    @_guarded
+    def dot(self, key, point, radius=0.03, color="#1f3b73", alpha=1.0, filled=True):
+        """A small disc (or, with filled=False, a thin circle) of `radius` metres."""
+        self._circle(key, point, radius, color, alpha, filled, 1.0, "-")
+
+    def _circle(self, key, center, radius, color, alpha, filled, width, style):
+        center = _point(center)
+        circle = self._artists.get(key)
+        if circle is None:
+            from matplotlib.patches import Circle
+            circle = Circle(center, float(radius), fill=filled, zorder=self.zorder)
+            self.axes.add_patch(circle)
+            self._artists[key] = circle
+        else:
+            circle.set_center(center)
+            circle.set_radius(float(radius))
+        circle.set_fill(filled)
+        circle.set_edgecolor(color)
+        circle.set_facecolor(color if filled else "none")
+        circle.set_linewidth(width)
+        circle.set_linestyle(style)
+        circle.set_alpha(alpha)
+
+    # -- arrows -----------------------------------------------------------------------------
+
+    @_guarded
+    def arrow(self, key, origin, vector, color="#1f3b73", width=2.0, head=0.04, alpha=1.0):
+        """
+        An arrow from `origin` along `vector`, both in metres, with a head `head` metres long;
+        `width` is the shaft's, in points as for lines. A zero vector hides it.
+        """
+        (x, y), (dx, dy) = _point(origin), _point(vector)
+        length = float(np.hypot(dx, dy))
+        arrow = self._artists.get(key)
+        if length < 1e-9:
+            if arrow is not None:
+                arrow.set_visible(False)
+            return
+        shaft = max(width, 0.1) * self._metres_per_point()
+        geometry = dict(x=x, y=y, dx=dx, dy=dy, width=shaft, head_width=0.8 * head,
+                        head_length=min(head, length))
+        if arrow is not None and hasattr(arrow, "set_data"):
+            arrow.set_data(**geometry)
+        else:
+            if arrow is not None:  # Matplotlib before 3.5 cannot move one: replace it
+                arrow.remove()
+            from matplotlib.patches import FancyArrow
+            arrow = FancyArrow(length_includes_head=True, zorder=self.zorder, linewidth=0,
+                               **geometry)
+            self.axes.add_patch(arrow)
+            self._artists[key] = arrow
+        arrow.set_color(color)
+        arrow.set_alpha(alpha)
+        arrow.set_visible(True)
+
+    def _metres_per_point(self) -> float:
+        """How many metres of the arena one typographic point spans in the figure."""
+        try:
+            x0, x1 = self.axes.get_xlim()
+            inches = self.figure.get_size_inches()[0] * self.axes.get_position().width
+            return abs(x1 - x0) / max(inches, 1e-9) / 72.0
+        except Exception:  # noqa: BLE001 -- the rps figure's own scale, near enough
+            return 0.0057
+
+    # -- text -------------------------------------------------------------------------------
+
+    @_guarded
+    def text(self, key, point, string, color="k", size=12, ha="left", va="center"):
+        """A label at `point`."""
+        x, y = _point(point)
+        label = self._artists.get(key)
+        if label is None:
+            label = self.axes.text(x, y, str(string), color=color, fontsize=size,
+                                   horizontalalignment=ha, verticalalignment=va,
+                                   zorder=self.zorder + 1)
+            self._artists[key] = label
+            return
+        label.set_position((x, y))
+        label.set_text(str(string))
+        label.set_color(color)
+        label.set_fontsize(size)
+        label.set_horizontalalignment(ha)
+        label.set_verticalalignment(va)
+
+    def clock(self, t, label=None, point=(-1.55, 0.93), size=14, color="k"):
+        """
+        "t = 12.3 s" (and the label after it) in the arena's top-left corner: the experiment's
+        own clock, so a still from the testbed's video can be matched to the run's time.
+        """
+        text = "t = %.1f s" % float(t)
+        if label:
+            text += "  %s" % label
+        self.text("__clock__", point, text, color=color, size=size, ha="left", va="center")
+
+    # -- by key -----------------------------------------------------------------------------
+
+    @_guarded
+    def hide(self, key):
+        """Stops drawing the key's artist, keeping it for show()."""
+        if key in self._artists:
+            self._artists[key].set_visible(False)
+
+    @_guarded
+    def show(self, key):
+        """Draws a hidden key's artist again."""
+        if key in self._artists:
+            self._artists[key].set_visible(True)
+
+    @_guarded
+    def remove(self, key):
+        """Takes the key's artist off the figure; the key's next call creates a new one."""
+        artist = self._artists.pop(key, None)
+        if artist is not None:
+            artist.remove()
+
+    def clear(self, prefix=""):
+        """Removes every key that starts with prefix: every key, by default."""
+        for key in [each for each in self._artists if str(each).startswith(prefix)]:
+            self.remove(key)
+
+    def keys(self) -> list:
+        """The keys drawn so far, in the order they were first drawn."""
+        return list(self._artists)
 
 
 # ---------------------------------------------------------------------------

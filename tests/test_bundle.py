@@ -85,3 +85,24 @@ def test_literals_round_trip():
 def test_auto_declares_the_forms_maximum(tmp_path):
     bundle = build(experiment(tmp_path, duration="auto"), tmp_path / "out")
     assert bundle.duration == 600
+
+
+def test_settings_reach_the_bundles_config_and_title(tmp_path):
+    variant = experiment(tmp_path, title="Arrow {config.controller}",
+                         config={"controller": "sheaf", "gain": 1.0})
+    variant.set_config(["controller=baseline", "gain=0.25"])
+    bundle = build(variant, tmp_path / "out")
+    namespace = {}
+    exec((bundle.directory / "robotarium_bundle.py").read_text(), namespace)
+    assert namespace["CONFIG"] == {"controller": "baseline", "gain": 0.25}
+    assert bundle.title == namespace["EXPERIMENT"]["title"] == "Arrow baseline"
+
+
+def test_a_shared_file_lands_flat_beside_the_main_file(tmp_path):
+    write(tmp_path / "common" / "overlay.py", "")
+    write(tmp_path / "common" / "sheafcore.jl", "")
+    bundle = build(experiment(tmp_path / "d1", files=["../common/overlay.py",
+                                                      "../common/*.jl"]),
+                   tmp_path / "d1" / ".robotarium")
+    assert [path.name for path in bundle.files] == ["main.py", "overlay.py", "sheafcore.jl"]
+    assert all(path.parent == bundle.directory for path in bundle.files)

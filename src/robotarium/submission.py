@@ -21,8 +21,8 @@ import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import budget, ledger, libraries, preflight, simulate
 from . import credentials as credentials_module
-from . import ledger, libraries, preflight, simulate
 from .bundle import Bundle, build
 from .client import (DASHBOARD_URL, RobotariumClient, RobotariumError, check_against_settings,
                      experiment_form)
@@ -114,19 +114,26 @@ def prepare(target, simulate_first: bool = None, echo: bool = True,
                                 % bundle.main.name))
     elif simulate_first or (simulate_first is None and project.simulate_first) \
             or experiment.duration == "measured":
+        estimate = budget.startup_estimate(project, bundle)
+        startup = estimate.seconds if estimate else None
         report = simulate.run(bundle, simulator=project.simulator_path,
                               fast=project.simulator_fast, headless=project.simulator_headless,
                               timeout=project.simulator_timeout,
-                              log_dir=Path(project.output_dir) / "runs", echo=echo)
+                              log_dir=Path(project.output_dir) / "runs", echo=echo,
+                              seed=project.simulator_seed)
+        simulate.save_last(report, bundle, project.output_dir, experiment.load_config())
         if experiment.duration == "measured":
             if errors(report.findings()):
                 findings.append(Finding(ERROR, "The duration is \"measured\", and the simulation "
                                                "that would settle it failed."))
             else:
+                # The Julia startup counts against the duration as much as the steps do.
                 experiment = dataclasses.replace(experiment,
-                                                 duration=report.suggested_duration)
+                                                 duration=report.suggested(startup))
                 bundle = build(experiment, project.output_dir, when=when)
-        findings.extend(report.findings(experiment))
+        findings.extend(report.findings(experiment, startup=startup))
+        if estimate:
+            findings.extend(estimate.findings)
 
     findings.extend(experiment.check())
     environment = libraries.load(libraries_file, simulator_path=project.simulator_path)
@@ -345,6 +352,9 @@ def _ledger_entry(prepared: Prepared, draft: bool, snapshot: Path) -> dict:
         else str(snapshot),
         "api": RobotariumClient().url,
     }
+    if prepared.experiment.config_set:
+        entry["set"] = {key: change["value"]
+                        for key, change in prepared.experiment.config_set.items()}
     if prepared.report is not None:
         report = prepared.report
         entry["simulation"] = {"steps": report.steps, "init_steps": report.init_steps,

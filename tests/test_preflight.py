@@ -286,3 +286,17 @@ def test_an_include_from_a_subdirectory_is_still_an_error(tmp_path):
     found = findings_for(tmp_path, LOADER, files={"backend.jl": 'include("./lib/ops.jl")\n',
                                                   "ops.jl": ""})
     assert "include it by base name" in messages(found, ERROR)
+
+
+def test_a_shared_module_from_outside_the_project_counts_as_uploaded(tmp_path):
+    root = tmp_path / "d1"
+    write(tmp_path / "common" / "overlay.py", "import numpy as np\n")
+    write(tmp_path / "common" / "sheafcore.jl", "module SheafCore\nend\n")
+    write(root / "main.py", "import overlay\nimport juliacall\n" + GOOD_MAIN)
+    write(root / "backend.jl", 'include("sheafcore.jl")\n')
+    experiment = Experiment(title="T", description="D", duration=60, robots=3, main="main.py",
+                            files=["../common/overlay.py", "../common/sheafcore.jl",
+                                   "backend.jl"], root=root)
+    bundle = build(experiment, root / ".robotarium")
+    found = check(bundle.files, experiment, libraries.load())
+    assert messages(found, ERROR) == "" and messages(found, WARNING) == ""

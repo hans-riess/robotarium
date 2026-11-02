@@ -428,3 +428,203 @@ def test_a_run_logs_copy_is_one_line_on_the_console(capsys):
     shown = ["step 1\n", "(a copy of run_1.npz, 6.0 KB, printed for the testbed's log.txt)\n",
              "Run log: run_1.npz\n"]
     assert list(tail) == shown and capsys.readouterr().out == "".join(shown)
+
+
+# ---------------------------------------------------------------------------
+# the duration budget, with Julia's startup
+# ---------------------------------------------------------------------------
+
+def run_of(steps, init_steps=300, **changes):
+    return SimulationReport(returncode=0, rps="/rps", robots=[4], init_steps=init_steps,
+                            steps=steps, ended=True, **changes)
+
+
+def test_startup_and_steps_must_fit_a_fixed_duration():
+    report = run_of(1500)                                   # 59.4 s of steps
+    assert levels(report.findings(experiment(duration=120)), ERROR) == ""
+    found = levels(report.findings(experiment(duration=120), startup=180), ERROR)
+    assert "about 239 s on the testbed (180 s of Julia startup, then 59 s of steps)" in found
+    assert "Declare 300" in found
+
+
+def test_under_auto_a_long_startup_is_warned_about_then_refused():
+    assert levels(run_of(9000).findings(experiment(duration="auto")), WARNING) == ""
+    near = run_of(9000).findings(experiment(duration="auto"), startup=270)   # 307 + 270 s
+    assert "577 s of the 600 s that \"auto\" declares" in levels(near, WARNING)
+    over = run_of(12000).findings(experiment(duration="auto"), startup=270)  # 406 + 270 s
+    assert "over the form's 600 s maximum" in levels(over, ERROR)
+
+
+def test_measured_counts_the_startup_in_its_suggestion():
+    report = run_of(1500)
+    assert report.suggested() == report.suggested_duration == 120
+    assert report.suggested(startup=180) == 300
+    assert "Suggested estimated duration: 300 s" in " ".join(
+        each.message for each in report.findings(experiment(duration="measured"), startup=180))
+
+
+def test_a_run_without_julia_is_judged_as_before():
+    report = run_of(3000)
+    assert report.findings(experiment(duration=60)) == \
+        report.findings(experiment(duration=60), startup=None)
+
+
+def test_a_slow_loop_is_a_warning_and_a_quick_one_a_note():
+    slow = run_of(100, loop_ms={"median": 20.0, "p99": 41.5, "max": 80.0, "count": 99})
+    assert "99th percentile 41.5 ms" in levels(slow.findings(experiment()), WARNING)
+    quick = run_of(100, loop_ms={"median": 1.0, "p99": 2.0, "max": 3.0, "count": 99})
+    assert levels(quick.findings(experiment()), WARNING) == ""
+    assert "within the testbed's 33 ms step" in " ".join(
+        each.message for each in quick.findings(experiment()))
+
+
+def test_the_shims_loop_statistics():
+    from robotarium._simshim import loop_statistics
+    assert loop_statistics([]) is None
+    stats = loop_statistics([0.001] * 98 + [0.050, 0.100])
+    assert stats["median"] == 1.0 and stats["max"] == 100.0 and stats["count"] == 100
+    assert 1.0 < stats["p99"] <= 100.0
+
+
+# ---------------------------------------------------------------------------
+# recording: videos and stills
+# ---------------------------------------------------------------------------
+
+def test_frames_are_read_in_order_without_repeats():
+    assert simulate.parse_frames("0, 14.5,end,14.5, 30s") == [0.0, 14.5, "end", 30.0]
+    assert simulate.parse_frames([0, 30, "END"]) == [0.0, 30.0, "end"]
+    assert simulate.parse_frames(None) == []
+    for bad in ("soon", "-1", "nan"):
+        with pytest.raises(ValueError):
+            simulate.parse_frames(bad)
+
+
+def test_a_still_is_taken_at_the_first_step_at_or_after_its_time():
+    from robotarium._simshim import still_step as shim_still_step
+    for seconds, step in ((0, 0), (14.5, 440), (14, 425), (0.33, 10), (0.034, 2)):
+        assert simulate.still_step(seconds) == shim_still_step(seconds) == step
+
+
+def test_still_names_have_one_dot():
+    assert [simulate.still_name(each) for each in (0, 14, 14.5, 0.25, "end")] == \
+        ["t0s.png", "t14s.png", "t14p5s.png", "t0p25s.png", "end.png"]
+    assert simulate.still_name(3, "pdf") == "t3s.pdf"
+
+
+def test_a_recording_checks_its_settings(tmp_path):
+    recording = simulate.Recording(video=tmp_path / "a.mp4", every=2)
+    assert recording.fps == 15 and recording.dpi == 200
+    environment = recording.environment()
+    assert environment["ROBOTARIUM_SIM_VIDEO"] == str((tmp_path / "a.mp4").resolve())
+    assert environment["ROBOTARIUM_SIM_EVERY"] == "2"
+    for bad in (dict(video=tmp_path / "a.avi"), dict(frames="0", frames_format="jpg",
+                                                     frames_dir=tmp_path),
+                dict(frames="0"), dict(video=tmp_path / "a.mp4", dpi=0),
+                dict(video=tmp_path / "a.mp4", fps=0)):
+        with pytest.raises(ValueError):
+            simulate.Recording(**bad)
+
+
+def test_a_video_without_ffmpeg_is_refused_before_anything_runs(tmp_path, monkeypatch):
+    experiment_, bundle = _bundle_of(tmp_path, "print('ran')\n")
+    monkeypatch.setattr(simulate.shutil, "which", lambda name: None)
+    started = []
+    monkeypatch.setattr(simulate.subprocess, "Popen", lambda *a, **k: started.append(a))
+    with pytest.raises(ValueError, match="needs ffmpeg"):
+        simulate.run(bundle, recording=simulate.Recording(video=tmp_path / "run.mp4"))
+    assert started == []
+    # Stills alone need no ffmpeg.
+    simulate.Recording(frames="0", frames_dir=tmp_path).check()
+
+
+def test_what_a_recording_reports_becomes_findings():
+    report = run_of(300, figure_forced=True, frames_missing=[30.0, 45.0],
+                    recording_error="ffmpeg exited with code 1 writing run.mp4")
+    found = report.findings(experiment())
+    assert "show_figure=False was overridden" in levels(found, "info")
+    warned = levels(found, WARNING)
+    assert "No still at 30 s: the experiment ended at 9.9 s" in warned
+    assert "No still at 45 s" in warned and "ffmpeg exited" in warned
+
+
+def test_the_last_simulation_is_kept_for_its_files(tmp_path):
+    experiment_, bundle = _bundle_of(tmp_path, "print('ran')\n")
+    report = run_of(900, init_steps=200)
+    assert simulate.save_last(report, bundle, tmp_path / ".robotarium", {"a": 1}).is_file()
+    last = simulate.last_simulation(bundle, tmp_path / ".robotarium", {"a": 1})
+    assert (last["steps"], last["init_steps"]) == (900, 200)
+    assert last["testbed_seconds"] == pytest.approx(36.3)
+    assert simulate.last_simulation(bundle, tmp_path / ".robotarium", {"a": 2}) is None
+    write(tmp_path / "main.py", "print('changed')\n")
+    changed = build(experiment_, tmp_path / ".robotarium")
+    assert simulate.last_simulation(changed, tmp_path / ".robotarium") is None
+    assert simulate.save_last(run_of(10, too_long=True), bundle, tmp_path / "x") is None
+
+
+RECORDED = """\
+import numpy as np
+import rps.robotarium as robotarium
+from robotarium_runtime import FloorOverlay, RunLogger
+log = RunLogger("recorded")
+r = robotarium.Robotarium(number_of_robots=2, show_figure=False)
+overlay = FloorOverlay(r)
+for k in range(20):
+    x = r.get_poses()
+    overlay.clock(k * 0.033)
+    log.record(poses=x)
+    r.set_velocities(np.arange(2), np.array([[0.1, 0.1], [0.0, 0.0]]))
+    r.step()
+r.debug()
+"""
+
+
+def _png_size(path):
+    import struct
+    return struct.unpack(">II", path.read_bytes()[16:24])
+
+
+@needs_simulator
+def test_stills_are_taken_at_experiment_times(tmp_path):
+    experiment_, bundle = _bundle_of(tmp_path, RECORDED)
+    frames = tmp_path / "frames"
+    report = simulate.run(bundle, echo=False, timeout=300, log_dir=tmp_path / "runs",
+                          recording=simulate.Recording(frames="0,0.5,end,30",
+                                                       frames_dir=frames, dpi=40))
+    assert report.returncode == 0, report.output
+    assert sorted(path.name for path in frames.iterdir()) == ["end.png", "t0p5s.png",
+                                                             "t0s.png"]
+    assert _png_size(frames / "t0s.png") == (330, 210)          # 8.25 x 5.25 in at 40 dpi
+    assert report.stills["t0p5s"]["seconds"] == 0.5
+    assert report.stills["end"]["seconds"] == pytest.approx(0.66)
+    assert report.figure_forced and report.frames_missing == [30.0]
+    found = report.findings(experiment_)
+    assert "No still at 30 s" in levels(found, WARNING)
+    assert report.loop_ms["count"] == 19
+
+
+@needs_simulator
+@pytest.mark.skipif(__import__("shutil").which("ffmpeg") is None, reason="needs ffmpeg")
+def test_a_video_is_an_mp4(tmp_path):
+    experiment_, bundle = _bundle_of(tmp_path, RECORDED)
+    video = tmp_path / "videos" / "run.mp4"
+    report = simulate.run(bundle, echo=False, timeout=300, log_dir=tmp_path / "runs",
+                          recording=simulate.Recording(video=video, dpi=40, every=2))
+    assert report.returncode == 0, report.output
+    assert report.video == str(video.resolve())
+    assert video.read_bytes()[4:8] == b"ftyp"
+
+
+@needs_simulator
+def test_one_seed_gives_one_start(tmp_path):
+    experiment_, bundle = _bundle_of(tmp_path, RECORDED)
+    import robotarium_runtime
+
+    def first_poses(seed, name):
+        runs = tmp_path / name
+        report = simulate.run(bundle, echo=False, timeout=300, log_dir=runs, seed=seed)
+        assert report.returncode == 0 and report.seed == seed, report.output
+        return robotarium_runtime.load_run(next(runs.glob("recorded_*.npz"))).data["poses"][0]
+
+    first = first_poses(4, "a")
+    assert (first_poses(4, "b") == first).all()
+    assert not (first_poses(5, "c") == first).all()

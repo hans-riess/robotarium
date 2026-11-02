@@ -50,4 +50,5 @@ testpaths = ["tests"]
 markers = [
     "simulator: runs the Robotarium simulator (rps); skipped where it is not installed",
     "live: submits to the real Robotarium; skipped unless ROBOTARIUM_LIVE_TEST=1",
+    "julia: installs Julia and packages for real; skipped unless ROBOTARIUM_JULIA_TESTS=1",
 ]

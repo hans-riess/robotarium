@@ -5,18 +5,21 @@ The `robotarium` command line.
     robotarium check                            every offline check, nothing sent
     robotarium bundle                           lay the files out as the testbed will see them
     robotarium simulate [--show]                rehearse it in the Robotarium simulator
+    robotarium simulate --video --frames 0,end  ... and record a video and stills of it
     robotarium submit [--dry-run] [--draft]     check, show, confirm, send, record
     robotarium history                          what has been sent, and how it went
     robotarium fetch [EXPERIMENT]               what came back: video, logs, data, messages
     robotarium login | logout | credentials     where the Robotarium login is kept
     robotarium limits                           the site's live limits
     robotarium julia lookup NAME                a [julia] packages entry, from the registry
-    robotarium julia check                      load the backend.jl here, as the testbed will
+    robotarium julia check [--cold]             load the backend.jl here, as the testbed will
     robotarium inspect RUN.npz                  what a RunLogger file holds
 
 Every command that works on an experiment takes the robotarium.toml (or a directory at or under
 it) as an optional positional, default the current directory. `submit` can also run without a
 manifest, from flags alone: --title, --description, --duration, --robots, --main, --file.
+`check`, `bundle`, `simulate`, `submit` and `julia check` take --set KEY=VALUE, a [config]
+value for this command only.
 """
 
 import argparse
@@ -30,12 +33,12 @@ from pathlib import Path
 
 from . import credentials as credentials_module
 from . import julia as julia_tools
-from . import ledger, libraries, limits, preflight, results, scaffold, simulate, submission
+from . import budget, ledger, libraries, limits, preflight, results, scaffold, simulate, submission
 from ._version import __version__
 from .bundle import BundleError, build
 from .client import RobotariumClient, RobotariumError
 from .experiment import Experiment, Project, find_manifest, load_project
-from .findings import ERROR, WARNING, errors, ordered
+from .findings import ERROR, INFO, WARNING, errors, ordered
 
 DESCRIPTION = "Bundle, check, simulate and submit experiments to the Georgia Tech Robotarium."
 
@@ -95,6 +98,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     command = commands.add_parser("check", help="every offline check; nothing is sent")
     add_project_argument(command)
+    add_set_argument(command)
     command.add_argument("--libraries", type=Path, metavar="FILE",
                          help="a libraries.txt to check imports against")
     command.add_argument("--strict", action="store_true", help="fail on warnings too")
@@ -103,16 +107,39 @@ def build_parser() -> argparse.ArgumentParser:
     command = commands.add_parser("bundle", help="lay the files out as the testbed will see "
                                                  "them, and show the form")
     add_project_argument(command)
+    add_set_argument(command)
     command.set_defaults(handler=run_bundle)
 
     command = commands.add_parser("simulate", help="rehearse the experiment in the simulator")
     add_project_argument(command)
+    add_set_argument(command)
     add_simulator_arguments(command)
     command.add_argument("--no-check", action="store_true", help="skip the static checks")
+    group = command.add_argument_group("recording (t = 0 is the first step after the drive to "
+                                       "the initial poses)")
+    group.add_argument("--video", nargs="?", const="", default=None, metavar="PATH.mp4",
+                       help="record the run's figure to an .mp4 (needs ffmpeg); default "
+                            ".robotarium/runs/<title>_<time>.mp4")
+    group.add_argument("--fps", type=int, metavar="N",
+                       help="the video's frames per second (default 30 / --every: real time)")
+    group.add_argument("--every", type=int, metavar="N",
+                       help="one frame of video every N steps (default 1)")
+    group.add_argument("--dpi", type=int, metavar="N",
+                       help="the figure's resolution, for the video and stills (default 200: "
+                            "1650 x 1050 pixels)")
+    group.add_argument("--frames", metavar="T1,T2,...,end",
+                       help="save stills at these experiment times, in seconds, and at the end")
+    group.add_argument("--frames-dir", type=Path, metavar="DIR",
+                       help="where the stills go (default beside the video, in <video>_frames/)")
+    group.add_argument("--frames-format", choices=simulate.FRAME_FORMATS,
+                       help="the stills' format (default png)")
+    group.add_argument("--seed", type=int, metavar="N",
+                       help="seed random and numpy.random, so the random initial poses repeat")
     command.set_defaults(handler=run_simulate)
 
     command = commands.add_parser("submit", help="check, show, confirm, send, record")
     add_project_argument(command)
+    add_set_argument(command)
     group = command.add_argument_group("the form (each overrides robotarium.toml)")
     group.add_argument("--title")
     group.add_argument("--description")
@@ -203,8 +230,28 @@ def build_parser() -> argparse.ArgumentParser:
     check = julia_commands.add_parser("check", help="load the backend here, as the testbed "
                                                     "will")
     add_project_argument(check)
+    add_set_argument(check)
     check.add_argument("--file", dest="julia_file", metavar="FILE.jl",
                        help="which .jl, when the bundle has several")
+    check.add_argument("--call", action="append", default=[], dest="calls",
+                       metavar="FUNC[=JSON]",
+                       help="after loading, call FUNC twice through call_json (with {} or the "
+                            "JSON given), timing the first call, which compiles it; repeatable")
+    cold = check.add_argument_group("a cold start, as on the testbed")
+    cold.add_argument("--cold", action="store_true",
+                      help="install Julia and every package from nothing, in a scratch depot, "
+                           "and time each phase; saved to .robotarium/julia/cold-start.json")
+    cold.add_argument("--keep-julia", action="store_true",
+                      help="with --cold: reuse the Julia installed here, not download one")
+    cold.add_argument("--cpus", type=int, metavar="N",
+                      help="with --cold: precompile with N tasks, as a smaller machine would")
+    cold.add_argument("--scratch", type=Path, metavar="DIR",
+                      help="with --cold: install into DIR (empty or new) rather than a "
+                           "temporary directory")
+    cold.add_argument("--keep-scratch", action="store_true",
+                      help="with --cold: leave the scratch directory in place afterwards")
+    check.add_argument("--timeout", type=float, metavar="SECONDS",
+                       help="give up after this long (default 1800, 3600 with --cold)")
     check.set_defaults(handler=run_julia_check)
 
     command = commands.add_parser("inspect", help="what a RunLogger .npz holds")
@@ -217,6 +264,20 @@ def build_parser() -> argparse.ArgumentParser:
 def add_project_argument(command: argparse.ArgumentParser) -> None:
     command.add_argument("project", type=Path, nargs="?", default=Path("."),
                          help="robotarium.toml, or a directory at or under it (default .)")
+
+
+def add_set_argument(command: argparse.ArgumentParser) -> None:
+    command.add_argument("--set", action="append", default=[], dest="settings",
+                         metavar="KEY=VALUE",
+                         help="set a [config] value for this run, read as TOML (gain=0.5, "
+                              "controller=baseline, gains.alpha=2); repeatable")
+
+
+def load(arguments) -> Project:
+    """The project the positional names, with --set applied to its config."""
+    project = load_project(arguments.project)
+    project.experiment.set_config(getattr(arguments, "settings", None))
+    return project
 
 
 def add_simulator_arguments(command: argparse.ArgumentParser) -> None:
@@ -269,28 +330,55 @@ def run_init(arguments) -> int:
 
 
 def run_check(arguments) -> int:
-    project = load_project(arguments.project)
+    project = load(arguments)
     bundle = build(project.experiment, project.output_dir)
     findings = project.experiment.check() + preflight.check(
         bundle.files, project.experiment,
         libraries.load(arguments.libraries, simulator_path=project.simulator_path))
+    findings += budget_findings(project, bundle)
     findings = ordered(list(dict.fromkeys(findings)))
     print_findings(findings)
     print_form(bundle)
+    last = last_run(project, bundle)
+    if last is not None or budget.uses_julia(project.experiment, bundle):
+        print()
+        print_budget(project, bundle)
     blocking = [each for each in findings
                 if each.level == ERROR or (arguments.strict and each.level == WARNING)]
     return 1 if blocking else 0
 
 
+def last_run(project: Project, bundle):
+    """The last simulation of these files and this config, or None; see simulate.save_last."""
+    return simulate.last_simulation(bundle, project.output_dir,
+                                    project.experiment.load_config())
+
+
+def budget_findings(project: Project, bundle) -> list:
+    """
+    The duration checks a simulation makes, from the last simulation of these same files,
+    without simulating again; none when there is no such simulation.
+    """
+    last = last_run(project, bundle)
+    estimate = budget.startup_estimate(project, bundle)
+    found = list(estimate.findings) if estimate else []
+    if last is None:
+        return found
+    report = simulate.SimulationReport(returncode=0, rps="(last simulation)",
+                                       init_steps=last["init_steps"], steps=last["steps"])
+    return found + [each for each in report.duration_findings(
+        project.experiment, estimate.seconds if estimate else 0.0) if each.level != INFO]
+
+
 def run_bundle(arguments) -> int:
-    project = load_project(arguments.project)
+    project = load(arguments)
     bundle = build(project.experiment, project.output_dir)
     print_form(bundle)
     return 0
 
 
 def run_simulate(arguments) -> int:
-    project = apply_simulator_arguments(load_project(arguments.project), arguments)
+    project = apply_simulator_arguments(load(arguments), arguments)
     bundle = build(project.experiment, project.output_dir)
     if not arguments.no_check:
         findings = preflight.check(bundle.files, project.experiment,
@@ -298,17 +386,66 @@ def run_simulate(arguments) -> int:
         if findings:
             print_findings(ordered(findings))
             print()
+    recording = recording_for(project, bundle, arguments)
+    if recording is not None:
+        recording.check()  # before anything runs
+    seed = arguments.seed if arguments.seed is not None else project.simulator_seed
+    estimate = budget.startup_estimate(project, bundle)
     print("Running %s in the simulator, from %s\n" % (bundle.main.name, bundle.directory))
     report = simulate.run(bundle, simulator=project.simulator_path, fast=project.simulator_fast,
                           headless=project.simulator_headless,
                           timeout=project.simulator_timeout,
-                          log_dir=Path(project.output_dir) / "runs")
-    findings = ordered(report.findings(project.experiment))
+                          log_dir=Path(project.output_dir) / "runs", recording=recording,
+                          seed=seed)
+    simulate.save_last(report, bundle, project.output_dir, project.experiment.load_config())
+    findings = report.findings(project.experiment,
+                               startup=estimate.seconds if estimate else None)
+    if estimate:
+        findings += estimate.findings
+    findings = ordered(findings)
     print()
     print_findings(findings)
     if report.robots:
         print("Run logs: %s" % (Path(project.output_dir) / "runs"))
+    if report.video:
+        print("Video:    %s" % report.video)
+    for label, still in sorted((report.stills or {}).items(),
+                               key=lambda item: item[1].get("seconds", 0)):
+        print("Still:    %s  (t = %.2f s)" % (still["path"], still["seconds"]))
     return 1 if errors(findings) else 0
+
+
+def recording_for(project: Project, bundle, arguments):
+    """
+    The Recording the command line and [simulator] ask for, the command line winning; None
+    when neither asks for a video or stills.
+    """
+    settings = dict(project.recording or {})
+    for key in ("fps", "every", "dpi", "frames_format"):
+        if getattr(arguments, key, None) is not None:
+            settings[key] = getattr(arguments, key)
+    if getattr(arguments, "frames", None) is not None:
+        settings["frames"] = arguments.frames
+    if getattr(arguments, "frames_dir", None) is not None:
+        settings["frames_dir"] = arguments.frames_dir.resolve()
+    video = settings.pop("video", None)
+    if getattr(arguments, "video", None) is not None:
+        video = arguments.video or True
+    if video is False:
+        video = None
+    frames = simulate.parse_frames(settings.get("frames"))
+    if not video and not frames:
+        return None
+    stem = simulate.recording_stem(project.output_dir, bundle.title)
+    if video is True:
+        video = stem.with_suffix(".mp4")
+    elif video:
+        video = Path(video).expanduser().resolve()
+    if frames and not settings.get("frames_dir"):
+        settings["frames_dir"] = (video.with_name(video.stem + "_frames") if video
+                                  else stem.with_name(stem.name + "_frames"))
+    settings["frames"] = frames
+    return simulate.Recording(video=video, **settings)
 
 
 def run_submit(arguments) -> int:
@@ -348,13 +485,16 @@ def project_for_submit(arguments) -> Project:
         if missing:
             raise ValueError("Without a robotarium.toml, submit needs %s." % ", ".join(missing))
         overrides.setdefault("duration", "auto")
-        return Project(experiment=Experiment(root=Path.cwd(), **overrides))
+        project = Project(experiment=Experiment(root=Path.cwd(), **overrides))
+        project.experiment.set_config(arguments.settings)
+        return project
 
     project = load_project(arguments.project)
     experiment = project.experiment
     for key, value in overrides.items():
         setattr(experiment, key, value)
     experiment.__post_init__()
+    experiment.set_config(arguments.settings)
     return project
 
 
@@ -499,13 +639,63 @@ def run_julia_lookup(arguments) -> int:
 
 
 def run_julia_check(arguments) -> int:
-    project = load_project(arguments.project)
+    project = load(arguments)
     bundle = build(project.experiment, project.output_dir)
-    print("Loading the Julia backend from %s, as the testbed will. The first run installs "
-          "Julia and the packages, which takes a while..." % bundle.directory)
-    loaded = julia_tools.check(bundle, arguments.julia_file)
-    print("Loaded %s, which exports: %s" % (loaded["module"], ", ".join(loaded["names"])))
+    calls = [julia_tools.parse_call(each) for each in arguments.calls]
+    if not arguments.cold:
+        if arguments.keep_julia or arguments.cpus or arguments.scratch or arguments.keep_scratch:
+            raise ValueError("--keep-julia, --cpus, --scratch and --keep-scratch go with --cold.")
+        print("Loading the Julia backend from %s, as the testbed will. The first run installs "
+              "Julia and the packages, which takes a while..." % bundle.directory)
+        loaded = julia_tools.check(bundle, arguments.julia_file, calls=calls,
+                                   timeout=arguments.timeout or 1800)
+        print("Loaded %s, which exports: %s" % (loaded["module"], ", ".join(loaded["names"])))
+        timings = loaded.get("timings") or {}
+        if timings:
+            print("Here, already installed: packages %.1f s, start %.1f s, include %.1f s%s."
+                  % (timings.get("resolve_seconds") or 0, timings.get("start_seconds") or 0,
+                     timings.get("include_seconds") or 0,
+                     "".join(", first %s() %.1f s (then %.3f s)" % (
+                         name, seconds, (loaded.get("warm_calls") or {}).get(name, 0))
+                             for name, seconds in (loaded.get("first_calls") or {}).items())))
+        return 0
+
+    testbed = budget.testbed_versions()
+    here = budget.local_versions()
+    for name, mine, theirs in zip(("juliacall", "juliapkg"), here, testbed):
+        if theirs and mine != theirs:
+            print("WARNING %s is %s here and %s on the testbed (libraries.txt), so this cold "
+                  "start may not be the testbed's: pip install '%s==%s'."
+                  % (name, mine or "not installed", theirs, name, theirs))
+    print("A cold start of the Julia backend in %s: Julia%s, the registry and every package "
+          "from nothing, as the testbed does at the start of each run. This takes minutes."
+          % (bundle.directory, " (reused)" if arguments.keep_julia else ""))
+    record = julia_tools.cold_check(
+        bundle, project.experiment, project.output_dir, julia_file=arguments.julia_file,
+        timeout=arguments.timeout or 3600, calls=calls, keep_julia=arguments.keep_julia,
+        cpus=arguments.cpus, scratch=arguments.scratch, keep_scratch=arguments.keep_scratch)
+    print()
+    print("Loaded %s, which exports: %s" % (record["module"], ", ".join(record["names"])))
+    print(julia_tools.describe_cold_start(record))
+    print("Saved %s" % record["path"])
+    if record.get("scratch"):
+        print("Kept the scratch directory %s" % record["scratch"])
+    print()
+    print_budget(project, bundle)
     return 0
+
+
+def print_budget(project: Project, bundle) -> None:
+    """The Julia startup and the last simulation's steps against the declared duration."""
+    estimate = budget.startup_estimate(project, bundle)
+    last = last_run(project, bundle)
+    if last is None:
+        if estimate:
+            print("Budget: %.0f s Julia startup (%s), plus the robots' steps: `robotarium "
+                  "simulate` counts them." % (estimate.seconds, estimate.detail))
+        return
+    print(budget.budget_line(estimate, last["testbed_seconds"], project.experiment.duration,
+                             steps=last["steps"] + last["init_steps"]))
 
 
 def run_inspect(arguments) -> int:

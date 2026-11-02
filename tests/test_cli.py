@@ -5,7 +5,9 @@ import os
 
 import pytest
 
-from robotarium import cli
+from robotarium import cli, ledger
+from robotarium.bundle import build
+from robotarium.experiment import load_project
 
 from conftest import HAS_SIMULATOR, PASSWORD, USERNAME, write
 
@@ -153,3 +155,128 @@ def test_output_cut_short_by_a_pipe_is_not_a_traceback(tmp_path):
                            capture_output=True, text=True, timeout=120)
     assert "Traceback" not in shell.stderr and "BrokenPipeError" not in shell.stderr
     assert shell.stdout.strip() == "0 error(s), 0 warning(s)."
+
+
+# ---------------------------------------------------------------------------
+# --set, recording options, the budget
+# ---------------------------------------------------------------------------
+
+def variant_project(tmp_path):
+    cli.main(["init", str(tmp_path / "exp"), "--example", "two_robots"])
+    manifest = tmp_path / "exp" / "robotarium.toml"
+    text = manifest.read_text().replace('title = "Two robots swap places ({timestamp})"',
+                                        'title = "Swap {config.controller}"')
+    manifest.write_text(text.replace("max_iterations = 1500",
+                                     'max_iterations = 1500\ncontroller = "sheaf"'))
+    return tmp_path / "exp"
+
+
+def bundled_config(project):
+    namespace = {}
+    exec((project / ".robotarium" / "bundle" / "robotarium_bundle.py").read_text(), namespace)
+    return namespace["CONFIG"], namespace["EXPERIMENT"]["title"]
+
+
+@pytest.mark.parametrize("command", ["check", "bundle"])
+def test_set_makes_the_bundle_the_variants(tmp_path, capsys, command):
+    project = variant_project(tmp_path)
+    assert cli.main([command, str(project), "--set", "controller=baseline",
+                     "--set", "max_iterations=10"]) == 0
+    assert bundled_config(project) == ({"max_iterations": 10, "controller": "baseline"},
+                                       "Swap baseline")
+    assert "Title                        Swap baseline" in capsys.readouterr().out
+
+
+def test_a_bad_setting_is_one_line(tmp_path, capsys):
+    project = variant_project(tmp_path)
+    assert cli.main(["check", str(project), "--set", "controller"]) == 1
+    assert "robotarium: --set takes KEY=VALUE" in capsys.readouterr().err
+
+
+def test_submit_sends_the_variant_and_records_it(tmp_path, fake_site, logged_in):
+    project = variant_project(tmp_path)
+    code = cli.main(["submit", str(project), "--set", "controller=baseline", "--no-simulate",
+                     "--yes"])
+    assert code == 0
+    sent = next(each["content"] for each in fake_site
+                if each.get("filename") == "robotarium_bundle.py").decode()
+    assert '"controller": "baseline"' in sent
+    create = next(each["json"] for each in fake_site if each["path"].endswith("create"))
+    assert create["title"] == "Swap baseline"
+    entry = ledger.read(project / ".robotarium")[-1]
+    assert entry["set"] == {"controller": "baseline"}
+
+
+def test_the_recording_options_become_a_recording(tmp_path):
+    project_dir = variant_project(tmp_path)
+    project = load_project(project_dir)
+    bundle = build(project.experiment, project.output_dir)
+    arguments = cli.build_parser().parse_args(
+        ["simulate", str(project_dir), "--video", "--frames", "0,14.5,end", "--every", "2",
+         "--dpi", "120", "--seed", "3"])
+    recording = cli.recording_for(project, bundle, arguments)
+    assert recording.video.parent == project.output_dir / "runs"
+    assert recording.video.name.startswith("swap_sheaf_") and recording.video.suffix == ".mp4"
+    assert recording.frames_dir == recording.video.with_name(recording.video.stem + "_frames")
+    assert (recording.frames, recording.every, recording.fps, recording.dpi) == \
+        ([0.0, 14.5, "end"], 2, 15, 120)
+
+    arguments = cli.build_parser().parse_args(
+        ["simulate", str(project_dir), "--video", str(tmp_path / "out.mp4"), "--frames", "end",
+         "--frames-dir", str(tmp_path / "stills"), "--frames-format", "pdf", "--fps", "60"])
+    recording = cli.recording_for(project, bundle, arguments)
+    assert recording.video == (tmp_path / "out.mp4").resolve() and recording.fps == 60
+    assert recording.frames_dir == (tmp_path / "stills").resolve()
+    assert recording.frames_format == "pdf"
+
+    arguments = cli.build_parser().parse_args(["simulate", str(project_dir)])
+    assert cli.recording_for(project, bundle, arguments) is None
+
+
+def test_the_manifest_can_ask_for_a_recording(tmp_path):
+    project_dir = variant_project(tmp_path)
+    manifest = project_dir / "robotarium.toml"
+    manifest.write_text(manifest.read_text().replace(
+        "headless = true", 'headless = true\nframes = [0, "end"]\ndpi = 90\nseed = 11'))
+    project = load_project(project_dir)
+    bundle = build(project.experiment, project.output_dir)
+    arguments = cli.build_parser().parse_args(["simulate", str(project_dir), "--dpi", "100"])
+    recording = cli.recording_for(project, bundle, arguments)
+    assert recording.video is None and recording.frames == [0.0, "end"]
+    assert recording.dpi == 100 and recording.frames_dir.name.endswith("_frames")
+    assert project.simulator_seed == 11
+
+
+def test_a_video_without_ffmpeg_fails_before_running(tmp_path, capsys, monkeypatch):
+    project = variant_project(tmp_path)
+    monkeypatch.setattr("robotarium.simulate.shutil.which", lambda name: None)
+    assert cli.main(["simulate", str(project), "--video"]) == 1
+    captured = capsys.readouterr()
+    assert "needs ffmpeg" in captured.err and "Running" not in captured.out
+
+
+def test_the_cold_start_options_need_cold(tmp_path, capsys):
+    cli.main(["init", str(tmp_path / "exp"), "--julia"])
+    assert cli.main(["julia", "check", str(tmp_path / "exp"), "--keep-julia"]) == 1
+    assert "go with --cold" in capsys.readouterr().err
+
+
+def test_check_shows_the_budget_from_the_last_simulation(tmp_path, capsys):
+    from robotarium.simulate import SimulationReport, save_last
+    cli.main(["init", str(tmp_path / "exp"), "--julia"])
+    manifest = tmp_path / "exp" / "robotarium.toml"
+    manifest.write_text(manifest.read_text().replace('duration = "auto"', "duration = 120"))
+    project = load_project(tmp_path / "exp")
+    bundle = build(project.experiment, project.output_dir)
+    save_last(SimulationReport(returncode=0, rps="/rps", robots=[4], init_steps=300,
+                               steps=1500, ended=True), bundle, project.output_dir,
+              project.experiment.load_config())
+    capsys.readouterr()
+    assert cli.main(["check", str(tmp_path / "exp")]) == 1
+    out = capsys.readouterr().out
+    assert "Budget: 180 s Julia startup (180 s assumed) + 59 s robots (1800 steps) = 239 s, " \
+           "against 120 s declared." in out
+    assert "assumed to take 180 s" in out and "Declare 300" in out
+    # A variant is another run: the last simulation says nothing about it.
+    assert cli.main(["check", str(tmp_path / "exp"), "--set", "radius=0.3"]) == 0
+    assert "robots' steps: `robotarium simulate` counts them" in capsys.readouterr().out
