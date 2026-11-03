@@ -36,8 +36,24 @@ STEP_SECONDS = 0.033
 #: What the form calls a GRITSBot experiment, as opposed to "quad".
 EXPERIMENT_TYPE = "ground"
 
+#: The testbed's Julia startup (installing Julia and the packages, starting it, loading the
+#: backend) when nothing better is known, in seconds. robosheaf's run with CellularSheaves.jl
+#: began to move about 171 s into its video; see budget.py.
+ASSUMED_JULIA_STARTUP = 180
 
-def suggested_duration(steps: int) -> int:
+#: What a cold start measured on this machine (`robotarium julia check --cold`) is multiplied by
+#: to estimate the testbed's: its machine and its network are not this one's.
+JULIA_COLD_MARGIN = 1.5
+
+#: What a startup timed on the testbed itself (fetched from its log.txt) is multiplied by.
+TESTBED_TIMING_MARGIN = 1.1
+
+#: Under "auto" (600 s declared), a run whose startup and steps come this close to the maximum
+#: is warned about: one slower start on the testbed would cut it off.
+AUTO_WARNING_SECONDS = 540
+
+
+def suggested_duration(steps: int, extra_seconds: float = 0) -> int:
     """
     An "Estimated Duration" for a run of `steps` Robotarium steps: the wall clock with a quarter
     again of headroom, rounded up to the minute and capped at the form's maximum. The testbed
@@ -45,7 +61,8 @@ def suggested_duration(steps: int) -> int:
 
     Args:
         steps (int): Calls to Robotarium.step(), the drive to the initial poses included.
+        extra_seconds (float): Wall clock before the first step, such as Julia's startup.
     """
-    wall_clock = steps * STEP_SECONDS
+    wall_clock = steps * STEP_SECONDS + float(extra_seconds or 0)
     minutes = -(-wall_clock * 1.25 // 60)
     return int(min(MAX_DURATION_SECONDS, max(60, minutes * 60)))

@@ -64,14 +64,40 @@ jobs:
         python-version: "3.10"
     - name: Import and exercise the runtime on 3.10
       working-directory: src
+      env:
+        MPLBACKEND: Agg
       run: |
-        pip install numpy
+        pip install numpy matplotlib
         python - <<'PY'
-        import tempfile
+        import fcntl, os, tempfile, types
+        import numpy as np
         import robotarium_runtime as rt
-        log = rt.RunLogger("ci", directory=tempfile.mkdtemp(), save_at_exit=False)
-        log.record(x=[1, 2])
+        directory = tempfile.mkdtemp()
+        log = rt.RunLogger("ci", directory=directory, save_at_exit=False, dtype="float32",
+                           copy_every=2, stdout_copy=True)
+        log.record(x=[1.5, 2.5], n=3)
         log.note("ok")
-        print(rt.load_run(log.save()))
+        run = rt.load_run(log.save())
+        assert run.data["x"].dtype == np.float32 and run.data["n"].dtype.kind == "i", run
+        print(run)
         print(rt.config(default={"ok": True}))
+        assert rt.julia_timings() == {}
+        print(rt.julia_key("=1.11.9", [("JSON3", "u", "1"), ("JSON3", "u", None)], "0.9.35",
+                           "0.1.24"))
+        # A copy into a non-blocking stdout, as Julia leaves it, is written whole.
+        flags = fcntl.fcntl(1, fcntl.F_GETFL)
+        fcntl.fcntl(1, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        rt._emit("non-blocking ok\n")
+        fcntl.fcntl(1, fcntl.F_SETFL, flags)
+        import matplotlib.pyplot as plt
+        figure, axes = plt.subplots(figsize=(8.25, 5.25))
+        overlay = rt.FloorOverlay(types.SimpleNamespace(_fig=figure, _axes_handle=axes))
+        for k in range(3):
+            overlay.segment("link", (0, 0), (0.1 * k, 0.2), color="#c03030", style=":")
+            overlay.ring("slot", (0.1 * k, 0), 0.08)
+            overlay.arrow("heading", (0, 0), (0.1, 0.05 * k))
+            overlay.clock(k * 0.033, label="ci")
+        assert overlay.error is None and overlay._artists["link"].get_linestyle() == ":"
+        figure.canvas.draw()
+        print("overlay ok:", overlay.keys())
         PY

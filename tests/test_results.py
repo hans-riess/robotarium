@@ -243,3 +243,28 @@ def test_a_copy_that_does_not_match_its_checksum_is_not_used():
     block = printed("run_1.npz", b"PK final" * 20).splitlines()
     block[1] = "A" * len(block[1])
     assert run_copies("\n".join(block)) == ({}, ["run_1.npz"])
+
+
+def test_the_julia_timing_printed_into_log_txt_is_kept(fake_site, tmp_path):
+    from robotarium_runtime import TIMING_MARKER
+    loaded = {"resolve_seconds": 150.0, "start_seconds": 8.0, "include_seconds": 12.0,
+              "first_calls": {}, "total_seconds": 170.0, "julia_version": "1.11.9", "key": "k"}
+    called = dict(loaded, first_calls={"build": 4.5}, total_seconds=174.5)
+    ran("[juliapkg] Locating Julia\n" + TIMING_MARKER % json.dumps(loaded) + "\nstep 1\n"
+        + TIMING_MARKER % json.dumps(called) + "\n-----ROBOTARIUM TIMING {broken-----\ndone\n")
+    result = fetch("exp-4", tmp_path, client=logged_in_client(), out=lambda *_: None)
+    assert result.julia_timing == called
+    assert json.loads((tmp_path / "julia_timing.json").read_text()) == called
+    assert tmp_path / "julia_timing.json" in result.written
+    text = describe(result)
+    assert "Julia 1.11.9 on the testbed: packages 150.0 s" in text
+    assert "first build() 4.5 s; 174 s in all" in text
+
+    again = fetch("exp-4", tmp_path, client=logged_in_client(), out=lambda *_: None)
+    assert tmp_path / "julia_timing.json" in again.kept
+
+
+def test_a_run_without_julia_leaves_no_timing(fake_site, tmp_path):
+    ran("step 1\ndone\n")
+    result = fetch("exp-4", tmp_path, client=logged_in_client(), out=lambda *_: None)
+    assert result.julia_timing is None and not (tmp_path / "julia_timing.json").exists()

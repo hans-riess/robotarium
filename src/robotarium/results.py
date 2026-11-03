@@ -9,6 +9,7 @@ files.
         logs/                   the log files (log.txt)
         data/                   the data files, and the RunLogger files copied out of log.txt
         scripts/                the files as uploaded, with --scripts
+        julia_timing.json       how long Julia took to start on the testbed, from log.txt
 
 So far the testbed has returned what a run prints but none of the files it writes
 (hans-riess/robotarium#7), so robotarium_runtime.RunLogger also prints each write of its file,
@@ -56,6 +57,10 @@ COPY_BEGIN = re.compile(r"^-----BEGIN ROBOTARIUM RUN (.+) (\d+) ([0-9a-f]{64})--
 COPY_END = "-----END ROBOTARIUM RUN %s-----"
 BASE64_LINE = re.compile(r"^[A-Za-z0-9+/=]+$")
 
+#: The line robotarium_runtime prints its Julia timings on (TIMING_MARKER), as JSON.
+TIMING = re.compile(r"^-----ROBOTARIUM TIMING (\{.*\})-----$")
+TIMING_FILE = "julia_timing.json"
+
 log = logging.getLogger(__name__)
 
 
@@ -76,6 +81,8 @@ class FetchResult:
         recovered (dict): The files in written and kept copied out of a log file, each to the
             log file it came from.
         damaged (list): What could not be copied out of the log files, as sentences.
+        julia_timing (dict): robotarium_runtime.julia_timings() as the run printed it last;
+            None when it loaded no Julia (or printed nothing).
     """
 
     experiment_id: str
@@ -88,6 +95,7 @@ class FetchResult:
     queue: dict = None
     recovered: dict = field(default_factory=dict)
     damaged: list = field(default_factory=list)
+    julia_timing: dict = None
 
     @property
     def status(self) -> str:
@@ -205,7 +213,42 @@ def fetch(experiment_id: str, directory: Path, client: RobotariumClient = None,
                       lambda sink, file_id=file_id: client.download_file(file_id, file_type,
                                                                          sink))
     _recover(result, force, out)
+    _julia_timing(result)
     return result
+
+
+def julia_timing(text: str):
+    """The last Julia timings a run's output holds (the most complete), or None."""
+    found = None
+    for line in text.splitlines():
+        match = TIMING.match(line.strip())
+        if match:
+            try:
+                parsed = json.loads(match.group(1))
+            except ValueError:
+                continue
+            if isinstance(parsed, dict):
+                found = parsed
+    return found
+
+
+def _julia_timing(result: FetchResult) -> None:
+    """Writes julia_timing.json from the log files' last timing marker, when there is one."""
+    logs = result.directory / "logs"
+    timing = None
+    for log_file in sorted(path for path in result.written + result.kept
+                           if path.parent == logs):
+        timing = julia_timing(log_file.read_text(encoding="utf-8", errors="replace")) or timing
+    if timing is None:
+        return
+    result.julia_timing = timing
+    target = result.directory / TIMING_FILE
+    text = json.dumps(timing, indent=2, sort_keys=True) + "\n"
+    if target.is_file() and target.read_text(encoding="utf-8") == text:
+        result.kept.append(target)
+        return
+    _write_text(target, text)
+    result.written.append(target)
 
 
 def run_copies(text: str) -> tuple:
@@ -312,6 +355,16 @@ def describe(result: FetchResult) -> str:
                                           if source else ""))
     for sentence in result.damaged:
         lines.append("  %s" % sentence)
+    timing = result.julia_timing
+    if timing:
+        calls = timing.get("first_calls") or {}
+        lines.append("  Julia %s on the testbed: packages %.1f s, start %.1f s, include %.1f s%s; "
+                     "%.0f s in all" % (
+                         timing.get("julia_version") or "?", timing.get("resolve_seconds") or 0,
+                         timing.get("start_seconds") or 0, timing.get("include_seconds") or 0,
+                         "".join(", first %s() %.1f s" % (name, seconds)
+                                 for name, seconds in calls.items()),
+                         timing.get("total_seconds") or 0))
     if result.missing:
         lines.append("  %s: %s" % ("nothing came back for" if result.finished
                                    else "not available yet", ", ".join(result.missing)))

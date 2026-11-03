@@ -217,17 +217,30 @@ testbed as `Path(__file__).parent / "name.npy"`.
 |---|---|
 | `robotarium init DIR --example two_robots` | Write the ready-made example above, to try the CLI on. |
 | `robotarium init DIR [--julia] [--robots N]` | Write a new experiment (manifest, main file, `.gitignore`, `.env.example`, and with `--julia` a `backend.jl`) that simulates and submits as it stands. |
-| `robotarium check` | Every offline check. Nothing is sent. Exits non-zero on an error (on a warning too with `--strict`). |
-| `robotarium bundle` | Build `.robotarium/bundle/` and show the form as it would be filled. |
-| `robotarium simulate [--show] [--simulator PATH]` | Run the bundle in the Robotarium simulator and judge the run as the testbed would. See [docs/simulator.md](docs/simulator.md). |
-| `robotarium submit [--dry-run] [--draft\|--queue] [--simulate] [-y]` | Bundle, check, optionally simulate, **print exactly what will be sent and wait for a yes**, then upload every file, create the experiment, mark the main file, and record the attempt. |
+| `robotarium check [--set KEY=VALUE]...` | Every offline check. Nothing is sent. Exits non-zero on an error (on a warning too with `--strict`). With a Julia backend or a recent simulation, also the duration budget. |
+| `robotarium bundle [--set KEY=VALUE]...` | Build `.robotarium/bundle/` and show the form as it would be filled. |
+| `robotarium simulate [--show] [--simulator PATH] [--set KEY=VALUE]... [--seed N]` | Run the bundle in the Robotarium simulator and judge the run as the testbed would. See [docs/simulator.md](docs/simulator.md). |
+| `robotarium simulate --video [PATH.mp4] [--fps N] [--every N] [--dpi N] [--frames T1,T2,...,end] [--frames-dir DIR] [--frames-format png\|pdf]` | ... and record a video of the run, or stills at chosen experiment times (t = 0 after the drive to the initial poses). See [Videos and still frames](docs/simulator.md#videos-and-still-frames). |
+| `robotarium submit [--dry-run] [--draft\|--queue] [--simulate] [--set KEY=VALUE]... [-y]` | Bundle, check, optionally simulate, **print exactly what will be sent and wait for a yes**, then upload every file, create the experiment, mark the main file, and record the attempt. |
 | `robotarium history [-n N] [--json]` | The submission ledger. |
 | `robotarium fetch [EXPERIMENT] [-o DIR] [--no-video] [--scripts] [--force]` | Download what came back from the testbed: the video, log files, data files and return messages. See [Results](#results-robotarium-fetch). |
 | `robotarium login`, `logout`, `credentials` | Where the login is kept. |
 | `robotarium limits` | The site's live limits (robots, duration, file types). |
 | `robotarium julia lookup NAME...` | A `[julia] packages` entry from Julia's General registry. |
-| `robotarium julia check` | Load the `backend.jl` locally, through the same code the testbed runs. |
+| `robotarium julia check [--file F.jl] [--call FUNC[=JSON]]... [--set KEY=VALUE]...` | Load the `backend.jl` locally, through the same code the testbed runs, and time each step. With several `.jl` files it loads `backend.jl` (and says so); `--file` names another. |
+| `robotarium julia check --cold [--keep-julia] [--cpus N] [--scratch DIR] [--keep-scratch] [--timeout S]` | Time a cold start, as the testbed makes one: Julia and every package from nothing, in a scratch depot. Saved to `.robotarium/julia/cold-start.json` for the duration budget. See [docs/julia.md](docs/julia.md#timing-a-cold-start-robotarium-julia-check---cold). |
 | `robotarium inspect RUN.npz` | What a `RunLogger` file holds. |
+
+`--set KEY=VALUE` changes a `[config]` value for one command (read as TOML, or as a string;
+dotted keys nest), so one manifest serves several variants, and the bundle, its `CONFIG` and a
+title with `{config.KEY}` are the variant's. A value the config has keeps its type where it can
+(`label=12` stays a string, `alpha=2` a float, `flag=False` a bool), and `check` warns when it
+changes type:
+
+```bash
+robotarium simulate --set controller=baseline --seed 1 --video --frames 0,30,end
+robotarium submit --draft --set controller=baseline -y
+```
 
 Every experiment command takes the manifest (or a directory at or under it) as an optional
 positional argument; the default is the current directory. `fetch` is the exception: its
@@ -242,7 +255,8 @@ Before anything is sent, and as far as possible before anything is run:
 - **The form:** title and description present; duration 1-600 s; 1-18 robots; the main file a
   `.py` or `.m`.
 - **The files:** they exist; no directories; only extensions the form takes (no `.json`, `.yaml`,
-  `.txt`, `.zip`); no two with the same base name.
+  `.txt`, `.zip`); no two with the same base name; a warning for one outside the manifest's git
+  work tree (shared code from `../common/` is fine, and uploaded flat).
 - **Inside the Python:**
   - imports the testbed lacks, checked against the simulator's `libraries.txt` and against
     Python 3.10's standard library, which the testbed appears to run (so `tomllib` is flagged);
@@ -252,10 +266,14 @@ Before anything is sent, and as far as possible before anything is run:
   - no `r.debug()` / `r.call_at_scripts_end()` at the end;
   - `skip_initialization=True`, a drive the testbed never skips;
   - numpy spellings newer than the testbed's.
-- **Inside the Julia:** packages loaded but not declared; `include`d files not uploaded.
+- **Inside the Julia:** packages loaded but not declared; `include`d files not uploaded; a
+  `[julia] version` that isn't an exact pin (`"1.11.9"` is a caret spec; write `"=1.11.9"`).
 - **In the simulator** (`simulate`, `submit --simulate`, or `duration = "measured"`): collisions and
   leaving the arena (errors: the testbed rejects them), saturated wheel commands, the robot
-  count actually used, whether the run fits its declared duration.
+  count actually used, the main file's own time per step against the testbed's 33 ms, and
+  whether the run fits its declared duration, **Julia's startup included**: the testbed
+  installs Julia and the packages before the first step, and `[julia] startup`, a fetched
+  testbed timing, `julia check --cold` or an assumed 180 s says how long that takes.
 - **Against the live site**, after logging in and before uploading: its current limits.
 
 Errors refuse the submission. Warnings are shown in the plan you confirm.
@@ -266,8 +284,8 @@ The testbed doesn't have this package installed. What runs there is your main fi
 supporting files, plus two files `robotarium bundle` adds when your code uses them:
 
 - **`robotarium_runtime.py`**, vendored from this package (standard library and numpy only,
-  Python 3.10 compatible): `config()`, `RunLogger`, `load_julia_backend()`, `VideoRecorder`,
-  `bundle_path()`.
+  Python 3.10 compatible): `config()`, `RunLogger`, `load_julia_backend()`, `julia_timings()`,
+  `FloorOverlay`, `VideoRecorder`, `bundle_path()`.
 - **`robotarium_bundle.py`**, generated: the title, robots, duration, commit and file hashes of
   the build, the `[config]` as `CONFIG`, and the `[julia]` packages, all as Python literals.
 
@@ -276,13 +294,20 @@ Outside a bundle, `config()` and `load_julia_backend()` read `robotarium.toml` i
 `python main.py` and the submitted bundle see the same values.
 
 ```python
-from robotarium_runtime import RunLogger, config
+from robotarium_runtime import FloorOverlay, RunLogger, config
 
 CONFIG = config(default={"radius": 0.5})
-log = RunLogger("circle", autosave_every=300)
+log = RunLogger("circle", autosave_every=300, copy_every=5, dtype="float32")
+overlay = FloorOverlay(r)            # draws on the simulator's figure; a no-op without one
 ...
+overlay.ring("goal1", goals[:, 0], 0.08)
+overlay.clock(step * 0.033)
 log.record(poses=x, velocities=dxu)
 ```
+
+`FloorOverlay` draws links, rails, rings, arrows, labels and a run clock in arena metres,
+updated in place each step; see
+[docs/simulator.md](docs/simulator.md#drawing-on-the-figure-flooroverlay).
 
 ## Julia: the backend.jl method
 
@@ -303,13 +328,29 @@ dependency versions. It then includes the file from beside the main file and ret
 backend locally exactly as the testbed will. `robotarium init --julia` is a working example.
 [docs/julia.md](docs/julia.md) explains each step and why.
 
+**Julia's startup counts against the duration.** The testbed installs Julia and every
+package at the start of each run, before the main file's first step; a run with
+CellularSheaves.jl has been seen to take nearly three minutes before its robots moved. So:
+
+- pin Julia exactly, `[julia] version = "=1.11.9"` (a bare `"1.11.9"` accepts any later 1.x);
+- `robotarium julia check --cold` times an install from nothing here and saves it;
+- `robotarium fetch` saves the testbed's own timing, which the runtime prints into `log.txt`;
+- `simulate` and `submit --simulate` add the best of those to the run's steps when they check
+  the declared duration: a fetched testbed timing first (or `[julia] startup` where that states
+  more), then `[julia] startup`, then a local cold start, else an assumed 180 s. `check` and a
+  `submit` that does not simulate use the last simulation's steps, or, without one, refuse a
+  startup that alone takes the whole duration.
+
 ## Logging
 
 - **In the experiment:** `RunLogger` records any per-step quantities to a self-describing
-  `.npz` (bundle title, commit, file hashes, notes), autosaving so that a run stopped at its
-  declared duration still leaves data. `robotarium inspect` reads it. The testbed hasn't been
-  returning data files, so each write is also printed into the run's `log.txt`, and
-  `robotarium fetch` turns it back into the `.npz`.
+  `.npz` (bundle title, commit, file hashes, notes, Julia timings), autosaving so that a run
+  stopped at its declared duration still leaves data. `robotarium inspect` reads it. The
+  testbed hasn't been returning data files, so each write is also printed into the run's
+  `log.txt`, and `robotarium fetch` turns it back into the `.npz`; `copy_every` and
+  `dtype="float32"` keep that copy small.
+- **Simulator runs:** `robotarium simulate --video --frames ...` writes a video and stills
+  into `.robotarium/runs/` beside the run logs.
 - **Submissions:** `.robotarium/submissions.jsonl` records every attempt, successful or not,
   with the experiment id, form values and file hashes. A failed attempt also records the stage
   it failed at and what it left on the site. A zip snapshot of exactly what was uploaded goes to
@@ -340,6 +381,7 @@ robotarium fetch https://www.robotarium.gatech.edu/experiment/6716f0a1b2...   # 
     video.mp4               the overhead video
     logs/log.txt            the run's output
     data/                   the data files, and each RunLogger .npz copied out of log.txt
+    julia_timing.json       how long Julia took to start there, from log.txt
 ```
 
 It prints the return messages, and for an experiment that hasn't run yet, its status and its
