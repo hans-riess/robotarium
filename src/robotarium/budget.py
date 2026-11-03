@@ -10,22 +10,28 @@ move about 171 s into the testbed's video.
 
 startup_estimate() takes the best figure there is, in this order:
 
-    1. [julia] startup = 240 (or "4m")          as stated
-    2. a timing fetched from the testbed         julia_timing.json under .robotarium/results/,
-                                                 for the same Julia and packages, x 1.1
+    1. a timing fetched from the testbed         julia_timing.json under .robotarium/results/,
+                                                 for the same Julia and packages, x 1.1; or
+                                                 [julia] startup, when that states more
+    2. [julia] startup = 240 (or "4m")           as stated
     3. a cold start measured here                .robotarium/julia/cold-start.json, written by
-                                                 `robotarium julia check --cold`, x 1.5
+                                                 `robotarium julia check --cold`, x 1.5; or as
+                                                 measured, as an upper bound, when it was
+                                                 measured without Julia's package servers
     4. nothing measured                          an assumed 180 s, with a warning
 
-and applies only to a bundle with a .jl file or [julia] packages.
+and applies only to a bundle with a .jl file or [julia] packages. budget_findings() turns the
+estimate, and the last simulation's steps, into the duration checks `check` and `submit` make
+without simulating.
 """
 
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import limits
-from .findings import INFO, WARNING, Finding
+from .findings import ERROR, INFO, WARNING, Finding
 
 #: Where `robotarium julia check --cold` keeps its measurement, under the output directory.
 COLD_START = Path("julia") / "cold-start.json"
@@ -44,12 +50,16 @@ class StartupEstimate:
         source (str): "stated", "testbed", "cold-start" or "assumed".
         detail (str): Where it comes from, as a phrase for the budget line.
         findings (list): What to tell about it: an INFO, or a WARNING when it is assumed.
+        upper_bound (bool): The startup takes at most this: a cold start measured here
+            without Julia's package servers, every package a git clone. What it alone pushes
+            past a limit is then a WARNING, not an ERROR.
     """
 
     seconds: float
     source: str
     detail: str
     findings: list = field(default_factory=list)
+    upper_bound: bool = False
 
 
 def uses_julia(experiment, bundle=None) -> bool:
@@ -139,36 +149,43 @@ def startup_estimate(project, bundle=None):
         return None
 
     stated = experiment.julia_startup
-    if isinstance(stated, int) and not isinstance(stated, bool):
-        detail = "[julia] startup = %d" % stated
-        return StartupEstimate(float(stated), "stated", detail, [Finding(
-            INFO, "Julia startup on the testbed: %d s, as [julia] startup states." % stated)])
+    if not isinstance(stated, int) or isinstance(stated, bool):
+        stated = None
+    margin = limits.TESTBED_TIMING_MARGIN
 
     fetched = testbed_timing(project)
     if fetched:
         path, timing = fetched
         measured = float(timing["total_seconds"])
-        seconds = measured * limits.TESTBED_TIMING_MARGIN
-        detail = "%.0f s timed on the testbed x %.1f" % (measured, limits.TESTBED_TIMING_MARGIN)
-        return StartupEstimate(seconds, "testbed", detail, [Finding(
-            INFO, "Julia startup on the testbed: about %.0f s, %.0f s as timed there (%s) x "
-                  "%.1f." % (seconds, measured, path.parent.name,
-                             limits.TESTBED_TIMING_MARGIN))])
+        seconds = measured * margin
+        timed = "%.0f s as timed there (%s) x %.1f" % (measured, path.parent.name, margin)
+        if stated is not None and stated >= seconds:
+            return StartupEstimate(float(stated), "stated", "[julia] startup = %d" % stated, [
+                Finding(INFO, "Julia startup on the testbed: %d s, as [julia] startup states; "
+                              "about %.0f s, %s, is less." % (stated, seconds, timed))])
+        findings = [Finding(INFO, "Julia startup on the testbed: about %.0f s, %s."
+                                  % (seconds, timed))]
+        if stated is not None:
+            findings.append(Finding(WARNING, "[julia] startup = %d is less than the testbed's "
+                                             "own timing, about %.0f s (%s), so the duration "
+                                             "checks count the timing. Raise [julia] startup "
+                                             "to at least %d, or leave it out to follow the "
+                                             "testbed's timings."
+                                    % (stated, seconds, timed, math.ceil(seconds))))
+        return StartupEstimate(seconds, "testbed", "%.0f s timed on the testbed x %.1f"
+                               % (measured, margin), findings)
+
+    if stated is not None:
+        return StartupEstimate(float(stated), "stated", "[julia] startup = %d" % stated, [
+            Finding(INFO, "Julia startup on the testbed: %d s, as [julia] startup states."
+                          % stated)])
 
     findings = []
     local = cold_start(project)
     if local:
         path, record, matches = local
         if matches and record.get("startup_seconds") is not None:
-            measured = float(record["startup_seconds"])
-            seconds = measured * limits.JULIA_COLD_MARGIN
-            detail = "%.0f s cold here x %.1f" % (measured, limits.JULIA_COLD_MARGIN)
-            return StartupEstimate(seconds, "cold-start", detail, [Finding(
-                INFO, "Julia startup on the testbed: about %.0f s, the %.0f s a cold start "
-                      "took here (%s) x %.1f. Fetching a testbed run's results replaces it "
-                      "with the testbed's own figure." % (
-                          seconds, measured, record.get("measured_at", path.name),
-                          limits.JULIA_COLD_MARGIN))])
+            return _cold_estimate(path, record)
         findings.append(Finding(INFO, "%s was measured with other Julia packages or versions "
                                       "than [julia] now declares, so it is not used; run "
                                       "`robotarium julia check --cold` again." % path))
@@ -185,6 +202,91 @@ def startup_estimate(project, bundle=None):
                                    "it as [julia] startup." % limits.ASSUMED_JULIA_STARTUP))
     return StartupEstimate(seconds, "assumed", "%d s assumed" % limits.ASSUMED_JULIA_STARTUP,
                            findings)
+
+
+def _cold_estimate(path, record) -> StartupEstimate:
+    """A cold start measured here, as the testbed's startup."""
+    measured = float(record["startup_seconds"])
+    when = record.get("measured_at", path.name)
+    findings = []
+    juliacall, juliapkg = testbed_versions()
+    if (juliacall and record.get("juliacall") != juliacall) \
+            or (juliapkg and record.get("juliapkg") != juliapkg):
+        findings.append(Finding(WARNING, "The cold start in %s was measured with juliacall %s "
+                                         "and juliapkg %s, and the testbed has %s and %s "
+                                         "(libraries.txt), which may install and start Julia "
+                                         "in another time. pip install those, and measure "
+                                         "again." % (path, record.get("juliacall"),
+                                                     record.get("juliapkg"), juliacall,
+                                                     juliapkg)))
+    if record.get("pkg_server") == "":
+        # Every package a git clone, and the registry too: far slower than the package
+        # servers the testbed's Pkg uses, so the measurement bounds the testbed's from above.
+        findings.insert(0, Finding(INFO, "Julia startup on the testbed: at most about %.0f s, "
+                                         "the cold start here (%s), which installed every "
+                                         "package by git clone with Julia's package servers "
+                                         "off (JULIA_PKG_SERVER is empty); the testbed's Pkg "
+                                         "uses them and is faster. Fetching a testbed run's "
+                                         "results replaces it with the testbed's own figure."
+                                   % (measured, when)))
+        return StartupEstimate(measured, "cold-start", "%.0f s cold here, by git clone, at "
+                               "most" % measured, findings, upper_bound=True)
+    seconds = measured * limits.JULIA_COLD_MARGIN
+    findings.insert(0, Finding(INFO, "Julia startup on the testbed: about %.0f s, the %.0f s a "
+                                     "cold start took here (%s) x %.1f. Fetching a testbed "
+                                     "run's results replaces it with the testbed's own figure."
+                               % (seconds, measured, when, limits.JULIA_COLD_MARGIN)))
+    return StartupEstimate(seconds, "cold-start", "%.0f s cold here x %.1f"
+                           % (measured, limits.JULIA_COLD_MARGIN), findings)
+
+
+def budget_findings(project, bundle, estimate=None) -> list:
+    """
+    The duration checks without simulating, as `check` and a `submit` that does not simulate
+    make them: the startup estimate's own findings, then the last simulation of these same
+    files and config judged with it (simulate.last_simulation), or, without one, whether the
+    startup alone already takes what the duration allows. The steps can only add to it.
+
+    Args:
+        project (Project): The experiment and its output directory.
+        bundle (Bundle): The built bundle.
+        estimate (StartupEstimate): The startup; default startup_estimate(project, bundle).
+    """
+    from . import simulate
+
+    if estimate is None:
+        estimate = startup_estimate(project, bundle)
+    found = list(estimate.findings) if estimate else []
+    experiment = project.experiment
+    last = simulate.last_simulation(bundle, project.output_dir, experiment.load_config())
+    if last is not None:
+        report = simulate.SimulationReport(returncode=0, rps="(last simulation)",
+                                           init_steps=last["init_steps"], steps=last["steps"])
+        return found + [each for each in report.duration_findings(
+            experiment, estimate.seconds if estimate else 0.0,
+            upper_bound=bool(estimate and estimate.upper_bound)) if each.level != INFO]
+    if not estimate:
+        return found
+
+    level = WARNING if estimate.upper_bound else ERROR
+    seconds, duration = estimate.seconds, experiment.duration
+    about = "at most about" if estimate.upper_bound else "about"
+    maximum = limits.MAX_DURATION_SECONDS
+    if isinstance(duration, int) and not isinstance(duration, bool) and seconds >= duration:
+        found.append(Finding(level, "Julia's startup alone, %s %.0f s (%s), takes all of the "
+                                    "%d s declared, before the robots' first step; the testbed "
+                                    "stops a run that outlasts its declared duration. %s"
+                             % (about, seconds, estimate.detail, duration,
+                                "Declare more, or \"auto\" (the form's maximum); `robotarium "
+                                "simulate` counts the steps." if seconds < maximum else
+                                "No declared duration fits it: the form's maximum is %d s."
+                                % maximum)))
+    elif duration in ("auto", "measured") and seconds >= maximum:
+        found.append(Finding(level, "Julia's startup alone, %s %.0f s (%s), is over the "
+                                    "form's %d s maximum, before the robots' first step, so "
+                                    "no declared duration fits the run."
+                             % (about, seconds, estimate.detail, maximum)))
+    return found
 
 
 def budget_line(estimate, run_seconds: float, duration, steps: int = None) -> str:

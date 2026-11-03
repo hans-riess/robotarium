@@ -50,7 +50,9 @@ r.debug()
   later can be matched to the exact files that produced it.
 - **Each write is also printed**, for the testbed's `log.txt`. See below.
 - **`dtype="float32"`** stores every floating-point value as float32, half the size; integers,
-  booleans and text are kept as recorded.
+  booleans and text are kept as recorded. float32 keeps about seven significant digits, so record
+  times relative to the run's start, never absolute clock readings: `time.monotonic()` a day
+  after boot is stored to the nearest 0.008 s, and at 10^6 s of uptime to the nearest 0.06 s.
 - **With a Julia backend**, the record's meta holds `"julia"`, the startup timings
   (`robotarium_runtime.julia_timings()`; see [julia.md](julia.md#timing-on-the-testbed)).
 
@@ -82,7 +84,8 @@ is never mistaken for the file.
 - **Mind the size.** A copy is a third larger than the file, and each write prints the whole
   file again. Seven robots over 4,545 steps (poses, commands, 16 residuals, an energy) make a
   1.8 MB file; autosaving every 300 records prints about 19 MB of base64 into `log.txt`.
-  `RunLogger(copy_every=N)` prints only every Nth write, and `dtype="float32"` halves each one:
+  `RunLogger(copy_every=N)` prints the first write and every Nth after it (writes 1, N + 1,
+  2N + 1, ...), and `dtype="float32"` halves each one:
 
   ```python
   log = RunLogger("formation", autosave_every=300, copy_every=5, dtype="float32")
@@ -90,7 +93,16 @@ is never mistaken for the file.
 
   The write at exit always prints, and so does `log.save(final=True)`, so the last copy in
   `log.txt` is the whole run. A write whose copy was held back is written and printed again at
-  exit, so a run that ends just after an autosave still leaves its copy.
+  exit, so a run that ends just after an autosave still leaves its copy. That needs the exit
+  handlers: a run killed outright leaves `log.txt` its last printed copy, up to N - 1 writes
+  behind. The tradeoff is the size of `log.txt` against what a killed run can lose.
+- **Whole, even under Julia.** Starting Julia (juliacall) makes stdout non-blocking, and a long
+  write into a full pipe then keeps what fits and drops the rest without an error. On a
+  non-blocking stdout, `RunLogger` therefore writes its copies, notes and the Julia timings
+  through the file descriptor itself, waiting while the pipe is full, so a copy printed mid-run
+  arrives whole. The main file's own
+  `print()` calls are not covered: after Julia has started, a long one into a slow reader can
+  still lose its end. `robotarium simulate` says so when a copy arrives cut short.
 - **When.** A copy is printed whenever stdout isn't a terminal: on the testbed, and in
   `robotarium simulate`, which shows each copy as one line. `RunLogger(stdout_copy=False)` turns
   it off; `stdout_copy=True` prints it in a terminal too.

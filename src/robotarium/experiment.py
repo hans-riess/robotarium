@@ -232,12 +232,15 @@ class Experiment:
         Args:
             settings: "KEY=VALUE" strings, or a {dotted key: value} dict. A string's VALUE is
                 read as a TOML value (3, 0.5, true, "text", [1, 2], { a = 1 }), and is taken as
-                a string when it is not one; a dotted KEY sets a value in a nested table.
+                a string when it is not one; a dotted KEY sets a value in a nested table. A
+                value the config already has keeps its type where the text allows it: a
+                string stays the text as typed (label=12 is "12"), a float stays a float
+                (alpha=2 is 2.0), and a bool also takes Python's True and False.
         """
         if isinstance(settings, dict):
-            pairs = [(key, value) for key, value in settings.items()]
+            pairs = [(key, value, None) for key, value in settings.items()]
         else:
-            pairs = [parse_setting(each) for each in settings or ()]
+            pairs = [parse_setting(each) + (_raw_value(each),) for each in settings or ()]
         if not pairs:
             return
         loaded = self.load_config()
@@ -246,7 +249,7 @@ class Experiment:
                              % type(loaded).__name__)
         # A copy, so the manifest's own table (or a caller's dict) is left as it was.
         config = _copy_plain(loaded) if loaded else {}
-        for key, value in pairs:
+        for key, value, raw in pairs:
             parts = _key_parts(key)
             table = config
             for depth, part in enumerate(parts[:-1]):
@@ -256,8 +259,10 @@ class Experiment:
                                      % (key, ".".join(parts[:depth + 1]), inner,
                                         parts[depth + 1]))
                 table = inner
-            self.config_set[".".join(parts)] = {
-                "value": value, "was": table.get(parts[-1], _ABSENT)}
+            was = table.get(parts[-1], _ABSENT)
+            if raw is not None:
+                value = _conform(raw, value, was)
+            self.config_set[".".join(parts)] = {"value": value, "was": was}
             table[parts[-1]] = value
         self.config = config
 
@@ -381,17 +386,29 @@ class Experiment:
             return [Finding(ERROR, "The config cannot travel to the testbed: %s" % error)]
         findings = []
         for key, change in self.config_set.items():
-            if change["was"] is _ABSENT:
+            value, was = change["value"], change["was"]
+            if was is _ABSENT:
                 findings.append(Finding(WARNING, "--set %s=%r adds %s, which the config does not "
                                                  "have. Check its spelling." % (
-                                                     key, change["value"], key)))
+                                                     key, value, key)))
+            elif _kind(value) != _kind(was):
+                findings.append(Finding(WARNING, "--set %s=%r replaces the config's %s %r with a "
+                                                 "%s. Check that this is meant, and that the "
+                                                 "main file takes it." % (
+                                                     key, value, _kind(was), was,
+                                                     _kind(value))))
             else:
                 findings.append(Finding(INFO, "--set %s=%r (the config says %r)." % (
-                    key, change["value"], change["was"])))
+                    key, value, was)))
         return findings
 
     def _check_julia_packages(self) -> list:
         findings = []
+        names = [package.name for package in self.julia_packages]
+        for name in sorted({each for each in names if names.count(each) > 1}):
+            findings.append(Finding(ERROR, "Julia package %s is listed %d times in [julia] "
+                                           "packages; list it once, with one version."
+                                    % (name, names.count(name))))
         for package in self.julia_packages:
             try:
                 uuid.UUID(str(package.uuid))
@@ -460,6 +477,19 @@ def _julia_version_finding(spec: str):
     text = spec.strip()
     if re.fullmatch(r"=\s*\d+\.\d+\.\d+", text):
         return None
+    # A hyphen range from one full release to itself is a pin too ("1.11.9 - 1.11.9").
+    hyphen = re.fullmatch(r"(\d+\.\d+\.\d+)\s+-\s+(\d+\.\d+\.\d+)", text)
+    if hyphen and hyphen.group(1) == hyphen.group(2):
+        return None
+    # "=1.11" pins one release, but Pkg fills in the missing parts with 0: Julia 1.11.0.
+    partial = re.fullmatch(r"=\s*(\d+)(?:\.(\d+))?", text)
+    if partial:
+        major, minor = partial.groups()
+        release = "%s.%s.0" % (major, minor or "0")
+        return Finding(WARNING, "[julia] version %r pins Julia %s exactly: Pkg reads the "
+                                "missing parts of an = version as 0. Write \"=%s\" if that is "
+                                "the release meant, or the one used here, such as "
+                                "\"=1.11.9\"." % (spec, release, release))
     bare = re.fullmatch(r"\^?\s*(\d+)(?:\.(\d+))?(?:\.(\d+))?", text)
     if bare:
         major, minor, patch = bare.groups()
@@ -514,6 +544,50 @@ def parse_setting(text: str) -> tuple:
     except tomllib.TOMLDecodeError:
         parsed = value
     return key.strip(), parsed
+
+
+def _raw_value(text: str) -> str:
+    """What a --set argument gives after the first =, as typed (stripped)."""
+    return str(text).partition("=")[2].strip()
+
+
+def _conform(raw: str, parsed, was):
+    """
+    A --set value in the type of the value it replaces, where its text allows: see
+    Experiment.set_config.
+
+        _conform("12", 12, "label") == "12"
+        _conform("2", 2, 1.5) == 2.0
+        _conform("False", "False", True) is False
+    """
+    if was is _ABSENT or was is None:
+        return raw == "True" if raw in ("True", "False") else parsed
+    if isinstance(was, bool):
+        if not isinstance(parsed, bool) and raw.lower() in ("true", "false"):
+            return raw.lower() == "true"
+        return parsed
+    if isinstance(was, str):
+        # A quoted TOML string, or text TOML does not read, is a string already; anything
+        # else (12, true, nan, a date) is kept as the text that was typed.
+        return parsed if isinstance(parsed, str) else raw
+    if isinstance(was, float) and isinstance(parsed, int) and not isinstance(parsed, bool):
+        return float(parsed)
+    return parsed
+
+
+def _kind(value) -> str:
+    """A config value's type, for --set's findings: ints and floats are both numbers."""
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, dict):
+        return "table"
+    if isinstance(value, list):
+        return "list"
+    return type(value).__name__
 
 
 def _key_parts(key: str) -> list:

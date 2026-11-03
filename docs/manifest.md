@@ -124,17 +124,20 @@ robotarium submit --draft --set controller=baseline --set gains.alpha=1.5 -y
 ```
 
 The value is read as TOML, and as a string when it isn't valid TOML (`controller=baseline`).
-A dotted key sets a value in a nested table. A key the config lacks is added, with a warning in
-case it is a misspelling. `python main.py` run directly reads the manifest as written, without
-the settings.
+A value the config already has keeps its type where the text allows it: a string stays the text
+as typed (`label=12` is `"12"`, `label=nan` is `"nan"`), a float stays a float (`alpha=2` is
+`2.0`), and a bool also takes Python's `True` and `False`. A value that still changes type
+(`show=maybe` for a bool) is a warning. A dotted key sets a value in a nested table. A key the
+config lacks is added, with a warning in case it is a misspelling. `python main.py` run
+directly reads the manifest as written, without the settings.
 
 ## `[julia]`: packages for a `backend.jl`
 
 | Key | Meaning |
 |---|---|
-| `packages` | `{ name, uuid, version }` for each Julia package your `.jl` files load. `version` is a Pkg compat specifier (`"1"`, `"0.0.1"`, `"=1.14.3"`) and is optional. `robotarium julia lookup NAME` prints the entry. |
-| `version` | A Julia compat specifier for juliapkg. Optional. Write an exact pin, `"=1.11.9"`: a bare `"1.11.9"` is a caret specifier, at least 1.11.9 and below 2, so the testbed may install a newer Julia, and `check` warns about it. |
-| `startup` | How long the testbed takes to install and start Julia before the first step, counted against the duration: `"measured"` (the default: from a testbed timing, a `julia check --cold`, or an assumed 180 s) or seconds (`240`, `"4m"`). See [julia.md](julia.md#the-startup-budget). |
+| `packages` | `{ name, uuid, version }` for each Julia package your `.jl` files load. `version` is a Pkg compat specifier (`"1"`, `"0.0.1"`, `"=1.14.3"`) and is optional. `robotarium julia lookup NAME` prints the entry. A package listed twice is an error. |
+| `version` | A Julia compat specifier for juliapkg. Optional. Write an exact pin, `"=1.11.9"`: a bare `"1.11.9"` is a caret specifier, at least 1.11.9 and below 2, so the testbed may install a newer Julia, and `check` warns about it. `"=1.11"` pins 1.11.0 (Pkg fills in the missing parts with 0), and `check` says so too. |
+| `startup` | How long the testbed takes to install and start Julia before the first step, counted against the duration: `"measured"` (the default: from a testbed timing, a `julia check --cold`, or an assumed 180 s) or seconds (`240`, `"4m"`). A fetched testbed timing that is larger replaces a stated figure, with a warning. See [julia.md](julia.md#the-startup-budget). |
 
 These are declared to juliapkg *before* Julia starts, by `robotarium_runtime.load_julia_backend`,
 on the testbed and locally. The standard library (`LinearAlgebra`, `Random`, ...) needs no

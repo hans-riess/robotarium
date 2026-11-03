@@ -300,6 +300,31 @@ def test_settings_without_a_config_make_one(tmp_path):
     assert found.load_config() == {"controller": "baseline"}
 
 
+def test_a_setting_keeps_the_type_of_the_value_it_replaces(tmp_path):
+    original = {"label": "sheaf", "alpha": 1.5, "show": True, "steps": 10, "when": "today"}
+    found = experiment(tmp_path, config=original)
+    found.set_config(["label=12", "alpha=2", "show=False", "steps=12", "when=2026-11-03"])
+    config = found.load_config()
+    assert config == {"label": "12", "alpha": 2.0, "show": False, "steps": 12,
+                      "when": "2026-11-03"}
+    assert isinstance(config["alpha"], float) and config["show"] is False
+    found = experiment(tmp_path, config=original)
+    found.set_config(["label=nan", "label=true", 'label="quoted"'])
+    assert found.load_config()["label"] == "quoted"
+    found = experiment(tmp_path, config=original)
+    found.set_config(["label=nan"])
+    assert found.load_config()["label"] == "nan"
+    assert not any(each.level == WARNING for each in found.check())
+
+
+def test_a_setting_that_changes_a_values_type_is_warned_about(tmp_path):
+    found = experiment(tmp_path, config={"show": True, "gain": 1})
+    found.set_config(["show=maybe", "gain=0.5"])
+    warnings = [each.message for each in found.check() if each.level == WARNING]
+    assert len(warnings) == 1
+    assert "replaces the config's bool True with a string" in warnings[0]
+
+
 def test_the_title_can_name_a_config_value(tmp_path):
     found = experiment(tmp_path, title="Arrow {config.controller} a={config.gains.alpha}",
                        config={"controller": "sheaf", "gains": {"alpha": 1.5}})
@@ -348,8 +373,26 @@ def test_a_julia_version_that_is_not_a_pin_is_warned_about(tmp_path, version, ex
 def test_an_exact_julia_pin_is_not_warned_about(tmp_path):
     found = experiment(tmp_path, julia_version="=1.11.9").check()
     assert [each for each in found if each.level == WARNING] == []
+    # Pkg reads a hyphen range from a release to itself as that release.
+    found = experiment(tmp_path, julia_version="1.11.9 - 1.11.9").check()
+    assert [each for each in found if each.level == WARNING] == []
     ranged = experiment(tmp_path, julia_version="1.10 - 1.11").check()
     assert any("exact pin" in each.message for each in ranged if each.level == WARNING)
+
+
+def test_a_short_equals_pin_is_said_to_mean_the_dot_zero_release(tmp_path):
+    found = [each for each in experiment(tmp_path, julia_version="=1.11").check()
+             if each.level == WARNING]
+    assert len(found) == 1
+    assert "pins Julia 1.11.0 exactly" in found[0].message
+    assert "more than one" not in found[0].message
+
+
+def test_a_julia_package_listed_twice_is_refused(tmp_path):
+    uuid = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
+    found = experiment(tmp_path, julia_packages=[
+        {"name": "JSON3", "uuid": uuid, "version": "1"}, {"name": "JSON3", "uuid": uuid}])
+    assert any("JSON3 is listed 2 times" in each.message for each in errors(found.check()))
 
 
 # ---------------------------------------------------------------------------

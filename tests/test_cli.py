@@ -277,6 +277,55 @@ def test_check_shows_the_budget_from_the_last_simulation(tmp_path, capsys):
     assert "Budget: 180 s Julia startup (180 s assumed) + 59 s robots (1800 steps) = 239 s, " \
            "against 120 s declared." in out
     assert "assumed to take 180 s" in out and "Declare 300" in out
-    # A variant is another run: the last simulation says nothing about it.
+    # A variant is another run: the last simulation says nothing about its steps, but the
+    # startup alone already takes the 120 s declared.
+    assert cli.main(["check", str(tmp_path / "exp"), "--set", "radius=0.3"]) == 1
+    out = capsys.readouterr().out
+    assert "robots' steps: `robotarium simulate` counts them" in out
+    assert "ERROR   Julia's startup alone, about 180 s (180 s assumed), takes all of the 120 s " \
+           "declared" in out
+    manifest.write_text(manifest.read_text().replace("duration = 120", "duration = 300"))
     assert cli.main(["check", str(tmp_path / "exp"), "--set", "radius=0.3"]) == 0
-    assert "robots' steps: `robotarium simulate` counts them" in capsys.readouterr().out
+
+
+def test_check_refuses_a_recording_simulate_would_refuse(tmp_path, capsys):
+    project_dir = variant_project(tmp_path)
+    manifest = project_dir / "robotarium.toml"
+    manifest.write_text(manifest.read_text().replace(
+        "headless = true", "headless = true\nfps = 7.5\nframes = [0]"))
+    assert cli.main(["check", str(project_dir)]) == 1
+    out = capsys.readouterr().out
+    assert "ERROR   [simulator]: --fps ([simulator] fps) must be a whole number of at least 1, " \
+           "not 7.5." in out
+
+
+HOLD_THE_LOCK = r"""
+import sys, time
+from robotarium.bundle import locked
+with locked(sys.argv[1]):
+    print("held", flush=True)
+    time.sleep(30)
+"""
+
+
+def test_a_second_command_on_a_project_waits_for_the_first(tmp_path, capsys):
+    import subprocess
+    import sys
+    from robotarium.bundle import BundleLocked, locked
+    project_dir = variant_project(tmp_path)
+    output_dir = project_dir / ".robotarium"
+    holder = subprocess.Popen([sys.executable, "-c", HOLD_THE_LOCK, str(output_dir)],
+                              stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        with pytest.raises(BundleLocked, match="still held by pid %d" % holder.pid):
+            with locked(output_dir, timeout=0.5):
+                pass
+        assert "Waiting for pid %d" % holder.pid in capsys.readouterr().err
+    finally:
+        holder.kill()
+        holder.wait()
+    # Once it has gone, the lock is free; and a holder may take it again inside.
+    with locked(output_dir, timeout=5):
+        with locked(output_dir, timeout=0):
+            assert cli.main(["bundle", str(project_dir)]) == 0

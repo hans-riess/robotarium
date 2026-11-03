@@ -227,13 +227,15 @@ testbed as `Path(__file__).parent / "name.npy"`.
 | `robotarium login`, `logout`, `credentials` | Where the login is kept. |
 | `robotarium limits` | The site's live limits (robots, duration, file types). |
 | `robotarium julia lookup NAME...` | A `[julia] packages` entry from Julia's General registry. |
-| `robotarium julia check [--call FUNC[=JSON]]... [--set KEY=VALUE]...` | Load the `backend.jl` locally, through the same code the testbed runs, and time each step. |
+| `robotarium julia check [--file F.jl] [--call FUNC[=JSON]]... [--set KEY=VALUE]...` | Load the `backend.jl` locally, through the same code the testbed runs, and time each step. With several `.jl` files it loads `backend.jl` (and says so); `--file` names another. |
 | `robotarium julia check --cold [--keep-julia] [--cpus N] [--scratch DIR] [--keep-scratch] [--timeout S]` | Time a cold start, as the testbed makes one: Julia and every package from nothing, in a scratch depot. Saved to `.robotarium/julia/cold-start.json` for the duration budget. See [docs/julia.md](docs/julia.md#timing-a-cold-start-robotarium-julia-check---cold). |
 | `robotarium inspect RUN.npz` | What a `RunLogger` file holds. |
 
 `--set KEY=VALUE` changes a `[config]` value for one command (read as TOML, or as a string;
 dotted keys nest), so one manifest serves several variants, and the bundle, its `CONFIG` and a
-title with `{config.KEY}` are the variant's:
+title with `{config.KEY}` are the variant's. A value the config has keeps its type where it can
+(`label=12` stays a string, `alpha=2` a float, `flag=False` a bool), and `check` warns when it
+changes type:
 
 ```bash
 robotarium simulate --set controller=baseline --seed 1 --video --frames 0,30,end
@@ -333,8 +335,11 @@ CellularSheaves.jl has been seen to take nearly three minutes before its robots 
 - pin Julia exactly, `[julia] version = "=1.11.9"` (a bare `"1.11.9"` accepts any later 1.x);
 - `robotarium julia check --cold` times an install from nothing here and saves it;
 - `robotarium fetch` saves the testbed's own timing, which the runtime prints into `log.txt`;
-- `simulate` and `submit --simulate` add the best of those (or `[julia] startup`, or an
-  assumed 180 s) to the run's steps when they check the declared duration.
+- `simulate` and `submit --simulate` add the best of those to the run's steps when they check
+  the declared duration: a fetched testbed timing first (or `[julia] startup` where that states
+  more), then `[julia] startup`, then a local cold start, else an assumed 180 s. `check` and a
+  `submit` that does not simulate use the last simulation's steps, or, without one, refuse a
+  startup that alone takes the whole duration.
 
 ## Logging
 

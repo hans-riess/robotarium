@@ -26,6 +26,7 @@ import json
 import os
 import platform
 import re
+import select
 import shutil
 import subprocess
 import sys
@@ -55,6 +56,67 @@ TIMING_MARKER = "-----ROBOTARIUM TIMING %s-----"
 
 #: When this module was imported: the zero of each note's "wall" time and of the timings.
 _IMPORTED = time.monotonic()
+
+
+def _emit(text: str) -> None:
+    """
+    Writes text to stdout whole, and flushes it.
+
+    Julia's runtime (libuv) makes stdout non-blocking when juliacall starts it. A plain write of
+    a long text into a pipe that is full then keeps what fits and drops the rest without an
+    error, so a run log's copy printed mid-run arrives cut short, its end line missing and the
+    next line glued to what came through. A non-blocking stdout is therefore written through its
+    file descriptor, waiting while the pipe is full; any other is written as usual.
+    """
+    stream = sys.stdout
+    if stream is None:
+        return
+    descriptor = _non_blocking(stream)
+    if descriptor is None:
+        stream.write(text)
+        stream.flush()
+        return
+    # What the stream holds already goes first, and it can meet a full pipe too.
+    while True:
+        try:
+            stream.flush()
+            break
+        except BlockingIOError:
+            _wait_writable(descriptor)
+    data = memoryview(text.encode(getattr(stream, "encoding", None) or "utf-8",
+                                  getattr(stream, "errors", None) or "strict"))
+    while data:
+        try:
+            written = os.write(descriptor, data)
+        except BlockingIOError:
+            _wait_writable(descriptor)
+            continue
+        except InterruptedError:
+            continue
+        data = data[written:]
+
+
+def _non_blocking(stream):
+    """The stream's file descriptor when it is non-blocking (POSIX only); else None."""
+    try:
+        import fcntl
+        descriptor = stream.fileno()
+        if fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_NONBLOCK:
+            return descriptor
+    except (ImportError, AttributeError, ValueError, OSError):  # io.UnsupportedOperation too
+        pass
+    return None
+
+
+def _wait_writable(descriptor: int) -> None:
+    """Until a full pipe has room again (a second at most, then the write is tried anyway)."""
+    if os.name == "posix":
+        try:
+            select.select([], [descriptor], [], 1.0)
+            return
+        except (OSError, ValueError):
+            pass
+    time.sleep(0.01)
 
 
 # ---------------------------------------------------------------------------
@@ -220,7 +282,10 @@ def julia_key(julia_version, packages, juliacall_version, juliapkg_version) -> s
     packages (name, uuid, version), and the juliacall and juliapkg versions. A timing is only
     compared with a project that has the same key.
     """
-    entries = sorted(_package_entry(each) for each in packages or ())
+    # A package listed twice, once without a version, must not fail the sort (None and a
+    # string do not compare).
+    entries = sorted((_package_entry(each) for each in packages or ()),
+                     key=lambda entry: tuple("" if part is None else part for part in entry))
     text = json.dumps({"julia": None if julia_version is None else str(julia_version),
                        "packages": [list(each) for each in entries],
                        "juliacall": juliacall_version, "juliapkg": juliapkg_version},
@@ -237,24 +302,43 @@ def _distribution_version(name):
         return getattr(module, "__version__", None)
 
 
+#: What the marker leaves out of julia_timings(): the key already identifies the packages and
+#: the platform, and the marker is kept to one short line in log.txt.
+_MARKER_OMITS = ("packages", "platform")
+
+
 def _print_timing() -> None:
-    """The human-readable line and the marker, when the timings changed since last printed."""
-    timings = julia_timings()
-    if not timings:
-        return
-    text = json.dumps(timings, sort_keys=True, separators=(",", ":"))
-    if text == _TIMING_PRINTED[0]:
-        return
-    _TIMING_PRINTED[0] = text
-    calls = timings["first_calls"]
-    print("robotarium_runtime: Julia %s: packages %.1f s, start %.1f s, include %.1f s%s; "
-          "%.1f s in all" % (
-              timings.get("julia_version") or "?", timings.get("resolve_seconds") or 0.0,
-              timings.get("start_seconds") or 0.0, timings.get("include_seconds") or 0.0,
-              "".join(", first %s() %.1f s" % (name, seconds)
-                      for name, seconds in calls.items()), timings["total_seconds"]),
-          flush=True)
-    print(TIMING_MARKER % text, flush=True)
+    """
+    The human-readable line and the marker, when the timings changed since last printed. Never
+    raises: the timings are bookkeeping, and the run must not fail over them.
+    """
+    try:
+        timings = julia_timings()
+        if not timings:
+            return
+        text = json.dumps({key: value for key, value in timings.items()
+                           if key not in _MARKER_OMITS}, sort_keys=True, separators=(",", ":"))
+        if text == _TIMING_PRINTED[0]:
+            return
+        _TIMING_PRINTED[0] = text
+        calls = timings["first_calls"]
+        _emit("robotarium_runtime: Julia %s: packages %.1f s, start %.1f s, include %.1f s%s; "
+              "%.1f s in all\n%s\n" % (
+                  timings.get("julia_version") or "?", timings.get("resolve_seconds") or 0.0,
+                  timings.get("start_seconds") or 0.0, timings.get("include_seconds") or 0.0,
+                  "".join(", first %s() %.1f s" % (name, seconds)
+                          for name, seconds in calls.items()), timings["total_seconds"],
+                  TIMING_MARKER % text))
+    except Exception as error:  # noqa: BLE001 -- see above
+        _report_bookkeeping(error)
+
+
+def _report_bookkeeping(error) -> None:
+    try:
+        print("robotarium_runtime: could not record the Julia timings: %s: %s"
+              % (type(error).__name__, error), flush=True)
+    except Exception:  # noqa: BLE001 -- nowhere left to say it
+        pass
 
 
 def declare_julia_packages(packages, julia_version=None) -> None:
@@ -370,15 +454,21 @@ def load_julia_backend(path="backend.jl", module=None, packages=None, julia_vers
     backend = getattr(jl, module) if module else jl
     _BACKENDS[path] = backend
 
-    juliacall_version = _distribution_version("juliacall")
-    juliapkg_version = _distribution_version("juliapkg")
-    _TIMINGS.update(
-        julia_version=_julia_version(jl), juliacall=juliacall_version, juliapkg=juliapkg_version,
-        julia_requested=None if julia_version is None else str(julia_version),
-        packages=[list(_package_entry(each)) for each in packages or ()],
-        key=julia_key(julia_version, packages, juliacall_version, juliapkg_version),
-        loaded_at=round(time.monotonic() - _IMPORTED, 3), cpus=os.cpu_count(),
-        platform=platform.platform())
+    # Bookkeeping, after the backend has loaded: whatever goes wrong here is reported, and the
+    # run goes on.
+    try:
+        juliacall_version = _distribution_version("juliacall")
+        juliapkg_version = _distribution_version("juliapkg")
+        _TIMINGS.update(
+            julia_version=_julia_version(jl), juliacall=juliacall_version,
+            juliapkg=juliapkg_version,
+            julia_requested=None if julia_version is None else str(julia_version),
+            packages=[list(_package_entry(each)) for each in packages or ()],
+            key=julia_key(julia_version, packages, juliacall_version, juliapkg_version),
+            loaded_at=round(time.monotonic() - _IMPORTED, 3), cpus=os.cpu_count(),
+            platform=platform.platform())
+    except Exception as error:  # noqa: BLE001 -- see above
+        _report_bookkeeping(error)
     _print_timing()
     return backend
 
@@ -417,6 +507,9 @@ def call_json(function, payload):
         return function(text)
     finally:
         calls[name] = round(time.monotonic() - started, 3)
+        # Into log.txt now, with this first call: a run the testbed stops before the run log's
+        # next write would otherwise leave only the marker printed at load, without it.
+        _print_timing()
 
 
 def _function_name(function) -> str:
@@ -482,8 +575,8 @@ class RunLogger:
     back into the .npz. `autosave_every` rewrites the file every that many records, so a run the
     testbed stops at its declared duration still leaves its data; it is also written when the
     interpreter exits. Every write prints the whole file again, so a long run that autosaves
-    often fills log.txt with copies: `copy_every` prints only every that many writes (and the
-    last), and `dtype="float32"` halves what floats take.
+    often fills log.txt with copies: `copy_every` prints only the first write and every that
+    many after it (and the last), and `dtype="float32"` halves what floats take.
 
     Args:
         name (str): The file name's stem; the start time is appended.
@@ -496,9 +589,14 @@ class RunLogger:
             stdout is not a terminal, as on the testbed and in `robotarium simulate`.
         dtype: A floating dtype, such as "float32", to store every floating-point value in;
             integers, booleans and text are kept as they are. None keeps each as recorded.
-        copy_every (int): With stdout_copy, print the copy on every this many writes only. The
-            write at exit, and save(final=True), always print it, so the last copy in log.txt
-            is the whole run.
+            float32 keeps about seven significant digits, so record times relative to the
+            run's start, not absolute clock readings: time.monotonic() a day after boot is
+            stored to the nearest 0.008 s, and later ones more coarsely.
+        copy_every (int): With stdout_copy, print the copy on the first write and on every
+            this many writes after it (writes 1, N + 1, 2N + 1, ...). The write at exit, and
+            save(final=True), always print it, so the last copy in log.txt is the whole run.
+            A run killed outright, with no exit handlers, leaves log.txt the last copy
+            printed: up to N - 1 writes behind.
     """
 
     def __init__(self, name="run", directory=None, meta=None, autosave_every=0,
@@ -605,7 +703,7 @@ class RunLogger:
                                    "wall": round(time.monotonic() - _IMPORTED, 3)})
         self._dirty = True
         if self.echo:
-            print("[step %d | %.2f s] %s" % (step, step * STEP_SECONDS, message), flush=True)
+            _emit("[step %d | %.2f s] %s\n" % (step, step * STEP_SECONDS, message))
 
     def save(self, final=False) -> Path:
         """
@@ -621,7 +719,10 @@ class RunLogger:
             arrays["__steps__" + key] = np.asarray(self._steps[key], dtype=np.int64)
         meta = dict(self.meta, saved_at=datetime.datetime.now().astimezone().isoformat(
             timespec="seconds"), records=self._records)
-        timings = julia_timings()
+        try:
+            timings = julia_timings()
+        except Exception:  # noqa: BLE001 -- bookkeeping must not cost the run its log
+            timings = None
         if timings and "julia" not in self.meta:
             meta["julia"] = timings
         arrays["__meta__"] = np.array(json.dumps(meta, default=_jsonable))
@@ -632,7 +733,8 @@ class RunLogger:
         _print_timing()
         self._saves += 1
         if self._copies_to_stdout():
-            if final or self._saves % self.copy_every == 0:
+            # The first write prints, so even a run killed early leaves one copy in log.txt.
+            if final or (self._saves - 1) % self.copy_every == 0:
                 self._print_copy(content)
                 self._copy_pending = False
             else:
@@ -663,17 +765,16 @@ class RunLogger:
             return False
 
     def _print_copy(self, content: bytes) -> None:
-        """The file as text, in one write so that nothing else lands inside it."""
-        sys.stdout.write("%s\n%s%s\n" % (
+        """The file as text, in one write so that nothing else lands inside it (see _emit)."""
+        _emit("%s\n%s%s\n" % (
             COPY_BEGIN % (self.path.name, len(content), hashlib.sha256(content).hexdigest()),
             base64.encodebytes(content).decode("ascii"), COPY_END % self.path.name))
-        sys.stdout.flush()
 
     def _save_if_dirty(self) -> None:
         # A write whose copy copy_every held back is written again, to print it.
         if self._dirty or self._copy_pending:
             try:
-                print("Run log: %s" % self.save(final=True), flush=True)
+                _emit("Run log: %s\n" % self.save(final=True))
             except Exception as error:  # noqa: BLE001 -- at exit, report rather than raise
                 print("robotarium_runtime: the run log could not be written: %s" % error)
 
@@ -737,8 +838,15 @@ def _guarded(method):
         except Exception as error:  # noqa: BLE001 -- see above
             self.enabled = False
             self.error = error
-            print("robotarium_runtime: FloorOverlay is off after an error in %s(): %s: %s"
-                  % (method.__name__, type(error).__name__, error), flush=True)
+            # What was drawn would otherwise stay on the floor, frozen at its last update.
+            for artist in list(self._artists.values()):
+                try:
+                    artist.set_visible(False)
+                except Exception:  # noqa: BLE001
+                    pass
+            print("robotarium_runtime: FloorOverlay is off, and what it drew is hidden, after "
+                  "an error in %s(): %s: %s" % (method.__name__, type(error).__name__, error),
+                  flush=True)
             return None
     wrapped.__name__ = method.__name__
     wrapped.__doc__ = method.__doc__
@@ -761,6 +869,13 @@ def _points(value) -> tuple:
     return array[0].tolist(), array[1].tolist()
 
 
+#: What a FloorOverlay line, ring, dot or arrow is drawn with until a call says otherwise.
+_LINE_STYLE = {"color": "#1f3b73", "width": 2.0, "style": "-", "alpha": 1.0}
+
+#: And a label.
+_TEXT_STYLE = {"color": "k", "size": 12, "ha": "left", "va": "center"}
+
+
 class FloorOverlay:
     """
     Draws on the simulator's arena figure: links between robots, rails, rings, arrows, labels
@@ -778,6 +893,14 @@ class FloorOverlay:
     Each drawing method takes a key. Its first call creates the artist; later calls with the
     same key move or restyle that artist, never a new one, so a loop of 4,000 steps keeps a
     handful of artists. hide(), show(), remove() and clear() act on keys.
+
+    A style argument (color, width, style, alpha, and a dot's radius and fill, an arrow's head,
+    a label's size and alignment) that a call leaves out keeps the key's current value; the
+    first call takes the default in the signature's docstring. So a loop may give only the
+    geometry once the style is set:
+
+        overlay.segment("rail", p, q, color="#c03030", width=3, style=":")   # first call
+        overlay.segment("rail", p2, q2)                                     # still red, dotted
 
     The figure is rps's: the axes r._axes_handle (or r.axes), the figure r._fig (or r.figure).
     Without them (show_figure=False, and the testbed unless it draws one) `enabled` is False,
@@ -810,75 +933,108 @@ class FloorOverlay:
         self.enabled = axes is not None
         self.error = None
         self._artists = {}
+        self._styles = {}
+
+    # -- styles -----------------------------------------------------------------------------
+
+    def _style(self, key, defaults: dict, **given) -> dict:
+        """The key's style: its current one (else `defaults`), with what this call gives."""
+        style = dict(defaults)
+        style.update(self._styles.get(key) or {})
+        style.update((name, value) for name, value in given.items() if value is not None)
+        self._styles[key] = style
+        return style
 
     # -- lines ------------------------------------------------------------------------------
 
     @_guarded
-    def segment(self, key, p, q, color="#1f3b73", width=2.0, style="-", alpha=1.0):
-        """A straight line from the point p to the point q."""
+    def segment(self, key, p, q, color=None, width=None, style=None, alpha=None):
+        """
+        A straight line from the point p to the point q. Defaults: color "#1f3b73", width
+        2.0 points, style "-", alpha 1.0.
+        """
         (x0, y0), (x1, y1) = _point(p), _point(q)
-        self._line(key, [x0, x1], [y0, y1], color, width, style, alpha)
+        self._line(key, [x0, x1], [y0, y1], self._style(
+            key, _LINE_STYLE, color=color, width=width, style=style, alpha=alpha))
 
     @_guarded
-    def polyline(self, key, points, color="#1f3b73", width=1.5, style="-", alpha=1.0,
+    def polyline(self, key, points, color=None, width=None, style=None, alpha=None,
                  closed=False):
-        """A path through the columns of a 2 x N array; closed joins the last to the first."""
+        """
+        A path through the columns of a 2 x N array; closed joins the last to the first.
+        Defaults: color "#1f3b73", width 1.5 points, style "-", alpha 1.0.
+        """
         xs, ys = _points(points)
         if closed and xs:
             xs, ys = xs + xs[:1], ys + ys[:1]
-        self._line(key, xs, ys, color, width, style, alpha)
+        self._line(key, xs, ys, self._style(key, dict(_LINE_STYLE, width=1.5), color=color,
+                                            width=width, style=style, alpha=alpha))
 
-    def _line(self, key, xs, ys, color, width, style, alpha):
+    def _line(self, key, xs, ys, style):
         line = self._artists.get(key)
         if line is None:
-            line, = self.axes.plot(xs, ys, color=color, linewidth=width, linestyle=style,
-                                   alpha=alpha, solid_capstyle="round", zorder=self.zorder)
+            line, = self.axes.plot(xs, ys, color=style["color"], linewidth=style["width"],
+                                   linestyle=style["style"], alpha=style["alpha"],
+                                   solid_capstyle="round", zorder=self.zorder)
             self._artists[key] = line
             return
         line.set_data(xs, ys)
-        line.set_color(color)
-        line.set_linewidth(width)
-        line.set_linestyle(style)
-        line.set_alpha(alpha)
+        line.set_color(style["color"])
+        line.set_linewidth(style["width"])
+        line.set_linestyle(style["style"])
+        line.set_alpha(style["alpha"])
 
     # -- circles ----------------------------------------------------------------------------
 
     @_guarded
-    def ring(self, key, center, radius, color="#1f3b73", width=2.0, style="-", alpha=1.0):
-        """An unfilled circle of `radius` metres."""
-        self._circle(key, center, radius, color, alpha, False, width, style)
+    def ring(self, key, center, radius, color=None, width=None, style=None, alpha=None):
+        """
+        An unfilled circle of `radius` metres. Defaults: color "#1f3b73", width 2.0 points,
+        style "-", alpha 1.0.
+        """
+        self._circle(key, center, radius, self._style(
+            key, dict(_LINE_STYLE, filled=False), color=color, width=width, style=style,
+            alpha=alpha))
 
     @_guarded
-    def dot(self, key, point, radius=0.03, color="#1f3b73", alpha=1.0, filled=True):
-        """A small disc (or, with filled=False, a thin circle) of `radius` metres."""
-        self._circle(key, point, radius, color, alpha, filled, 1.0, "-")
+    def dot(self, key, point, radius=None, color=None, alpha=None, filled=None):
+        """
+        A small disc (or, with filled=False, a thin circle) of `radius` metres. Defaults:
+        radius 0.03, color "#1f3b73", alpha 1.0, filled.
+        """
+        style = self._style(key, dict(_LINE_STYLE, width=1.0, radius=0.03, filled=True),
+                            radius=radius, color=color, alpha=alpha, filled=filled)
+        self._circle(key, point, style["radius"], style)
 
-    def _circle(self, key, center, radius, color, alpha, filled, width, style):
+    def _circle(self, key, center, radius, style):
         center = _point(center)
         circle = self._artists.get(key)
         if circle is None:
             from matplotlib.patches import Circle
-            circle = Circle(center, float(radius), fill=filled, zorder=self.zorder)
+            circle = Circle(center, float(radius), fill=style["filled"], zorder=self.zorder)
             self.axes.add_patch(circle)
             self._artists[key] = circle
         else:
             circle.set_center(center)
             circle.set_radius(float(radius))
-        circle.set_fill(filled)
-        circle.set_edgecolor(color)
-        circle.set_facecolor(color if filled else "none")
-        circle.set_linewidth(width)
-        circle.set_linestyle(style)
-        circle.set_alpha(alpha)
+        circle.set_fill(style["filled"])
+        circle.set_edgecolor(style["color"])
+        circle.set_facecolor(style["color"] if style["filled"] else "none")
+        circle.set_linewidth(style["width"])
+        circle.set_linestyle(style["style"])
+        circle.set_alpha(style["alpha"])
 
     # -- arrows -----------------------------------------------------------------------------
 
     @_guarded
-    def arrow(self, key, origin, vector, color="#1f3b73", width=2.0, head=0.04, alpha=1.0):
+    def arrow(self, key, origin, vector, color=None, width=None, head=None, alpha=None):
         """
         An arrow from `origin` along `vector`, both in metres, with a head `head` metres long;
-        `width` is the shaft's, in points as for lines. A zero vector hides it.
+        `width` is the shaft's, in points as for lines. A zero vector hides it. Defaults:
+        color "#1f3b73", width 2.0 points, head 0.04 m, alpha 1.0.
         """
+        style = self._style(key, dict(_LINE_STYLE, head=0.04), color=color, width=width,
+                            head=head, alpha=alpha)
         (x, y), (dx, dy) = _point(origin), _point(vector)
         length = float(np.hypot(dx, dy))
         arrow = self._artists.get(key)
@@ -886,7 +1042,8 @@ class FloorOverlay:
             if arrow is not None:
                 arrow.set_visible(False)
             return
-        shaft = max(width, 0.1) * self._metres_per_point()
+        head = float(style["head"])
+        shaft = max(float(style["width"]), 0.1) * self._metres_per_point()
         geometry = dict(x=x, y=y, dx=dx, dy=dy, width=shaft, head_width=0.8 * head,
                         head_length=min(head, length))
         if arrow is not None and hasattr(arrow, "set_data"):
@@ -899,8 +1056,8 @@ class FloorOverlay:
                                **geometry)
             self.axes.add_patch(arrow)
             self._artists[key] = arrow
-        arrow.set_color(color)
-        arrow.set_alpha(alpha)
+        arrow.set_color(style["color"])
+        arrow.set_alpha(style["alpha"])
         arrow.set_visible(True)
 
     def _metres_per_point(self) -> float:
@@ -915,22 +1072,23 @@ class FloorOverlay:
     # -- text -------------------------------------------------------------------------------
 
     @_guarded
-    def text(self, key, point, string, color="k", size=12, ha="left", va="center"):
-        """A label at `point`."""
+    def text(self, key, point, string, color=None, size=None, ha=None, va=None):
+        """A label at `point`. Defaults: color "k", size 12, ha "left", va "center"."""
+        style = self._style(key, _TEXT_STYLE, color=color, size=size, ha=ha, va=va)
         x, y = _point(point)
         label = self._artists.get(key)
         if label is None:
-            label = self.axes.text(x, y, str(string), color=color, fontsize=size,
-                                   horizontalalignment=ha, verticalalignment=va,
-                                   zorder=self.zorder + 1)
+            label = self.axes.text(x, y, str(string), color=style["color"],
+                                   fontsize=style["size"], horizontalalignment=style["ha"],
+                                   verticalalignment=style["va"], zorder=self.zorder + 1)
             self._artists[key] = label
             return
         label.set_position((x, y))
         label.set_text(str(string))
-        label.set_color(color)
-        label.set_fontsize(size)
-        label.set_horizontalalignment(ha)
-        label.set_verticalalignment(va)
+        label.set_color(style["color"])
+        label.set_fontsize(style["size"])
+        label.set_horizontalalignment(style["ha"])
+        label.set_verticalalignment(style["va"])
 
     def clock(self, t, label=None, point=(-1.55, 0.93), size=14, color="k"):
         """
@@ -960,6 +1118,7 @@ class FloorOverlay:
     def remove(self, key):
         """Takes the key's artist off the figure; the key's next call creates a new one."""
         artist = self._artists.pop(key, None)
+        self._styles.pop(key, None)
         if artist is not None:
             artist.remove()
 

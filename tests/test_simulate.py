@@ -430,6 +430,58 @@ def test_a_run_logs_copy_is_one_line_on_the_console(capsys):
     assert list(tail) == shown and capsys.readouterr().out == "".join(shown)
 
 
+def test_a_copy_cut_short_is_said_to_be_and_hides_nothing_after_it(capsys):
+    content = b"PK" * 3000
+    text = base64.encodebytes(content).decode("ascii")
+    # What a full non-blocking pipe used to make of a copy: its end lost, the next line glued
+    # to the last fragment that came through.
+    stream = io.StringIO("-----BEGIN ROBOTARIUM RUN run_1.npz %d %s-----\n%s%s"
+                         "[step 5 | 0.17 s] next phase\nDone\n" % (
+                             len(content), hashlib.sha256(content).hexdigest(),
+                             text[:2 * 77], "UEsDBBQ"))      # two lines, and a fragment
+    tail = collections.deque(maxlen=60)
+    simulate._relay(stream, tail, echo=True)
+    shown = capsys.readouterr().out.splitlines()
+    assert shown[0] == "(a copy of run_1.npz, 6.0 KB, printed for the testbed's log.txt)"
+    assert shown[1].startswith("(... the copy of run_1.npz was cut short")
+    assert shown[2] == "UEsDBBQ[step 5 | 0.17 s] next phase"
+    assert shown[3] == "Done"                # base64-like text after it is not taken for base64
+
+
+NON_BLOCKING_MAIN = """\
+import fcntl, os
+import numpy as np
+import rps.robotarium as robotarium
+from robotarium_runtime import RunLogger
+# As juliacall leaves it: Julia's libuv makes the stdout it shares non-blocking.
+fcntl.fcntl(1, fcntl.F_SETFL, fcntl.fcntl(1, fcntl.F_GETFL) | os.O_NONBLOCK)
+log = RunLogger("big", copy_every=1)
+r = robotarium.Robotarium(number_of_robots=2, show_figure=False)
+noise = np.random.default_rng(0).random(60000)
+for k in range(6):
+    log.record(poses=r.get_poses(), noise=noise)
+    if k == 2:
+        log.save()                           # mid-run: about 1.3 MB of base64
+        log.note("after the save")
+    r.set_velocities(np.arange(2), np.zeros((2, 2)))
+    r.step()
+r.debug()
+"""
+
+
+@needs_simulator
+@pytest.mark.skipif(sys.platform == "win32", reason="O_NONBLOCK is POSIX")
+def test_a_copy_printed_mid_run_shows_as_one_line_before_the_next(tmp_path):
+    experiment_, bundle = _bundle_of(tmp_path, NON_BLOCKING_MAIN)
+    report = simulate.run(bundle, echo=False, timeout=300, log_dir=tmp_path / "runs")
+    assert report.returncode == 0, report.output
+    lines = report.output.splitlines()
+    copies = [number for number, line in enumerate(lines) if line.startswith("(a copy of big_")]
+    assert len(copies) == 2                  # mid-run, and at exit
+    assert lines[copies[0] + 1] == "[step 2 | 0.07 s] after the save"
+    assert not any("cut short" in line for line in lines)
+
+
 # ---------------------------------------------------------------------------
 # the duration budget, with Julia's startup
 # ---------------------------------------------------------------------------
@@ -445,6 +497,25 @@ def test_startup_and_steps_must_fit_a_fixed_duration():
     found = levels(report.findings(experiment(duration=120), startup=180), ERROR)
     assert "about 239 s on the testbed (180 s of Julia startup, then 59 s of steps)" in found
     assert "Declare 300" in found
+
+
+def test_a_run_no_duration_fits_is_not_told_to_declare_one():
+    over = run_of(12000)                                    # 406 s of steps
+    found = levels(over.findings(experiment(duration=300), startup=480), ERROR)
+    assert "No declared duration fits it" in found and "Declare 600" not in found
+    # As "measured" makes it: the suggestion capped at the form's 600 s.
+    found = levels(over.findings(experiment(duration=600), startup=480), ERROR)
+    assert "No declared duration fits it" in found and "Declare" not in found
+
+
+def test_an_upper_bound_on_the_startup_warns_where_it_alone_would_refuse():
+    report = run_of(1500)                                   # 59.4 s of steps
+    found = report.findings(experiment(duration=120), startup=180, upper_bound=True)
+    assert levels(found, ERROR) == ""
+    assert "at most about 239 s" in levels(found, WARNING)
+    # Steps that alone outlast the duration are refused whatever the startup.
+    found = run_of(4000).findings(experiment(duration=120), startup=180, upper_bound=True)
+    assert "the testbed stops a run that outlasts" in levels(found, ERROR)
 
 
 def test_under_auto_a_long_startup_is_warned_about_then_refused():
@@ -594,7 +665,8 @@ def test_stills_are_taken_at_experiment_times(tmp_path):
     assert sorted(path.name for path in frames.iterdir()) == ["end.png", "t0p5s.png",
                                                              "t0s.png"]
     assert _png_size(frames / "t0s.png") == (330, 210)          # 8.25 x 5.25 in at 40 dpi
-    assert report.stills["t0p5s"]["seconds"] == 0.5
+    # Taken at step ceil(0.5 / 0.033) = 16, and reported at that step's time.
+    assert report.stills["t0p5s"]["seconds"] == 0.528
     assert report.stills["end"]["seconds"] == pytest.approx(0.66)
     assert report.figure_forced and report.frames_missing == [30.0]
     found = report.findings(experiment_)
@@ -628,3 +700,90 @@ def test_one_seed_gives_one_start(tmp_path):
     first = first_poses(4, "a")
     assert (first_poses(4, "b") == first).all()
     assert not (first_poses(5, "c") == first).all()
+
+
+@needs_simulator
+@pytest.mark.skipif(__import__("shutil").which("ffmpeg") is None, reason="needs ffmpeg")
+def test_without_debug_the_end_still_and_video_are_made_at_exit(tmp_path):
+    # Exit handlers run last registered first, and pyplot's closes every figure: the shim's
+    # own has to come before it.
+    experiment_, bundle = _bundle_of(tmp_path, RECORDED.replace("r.debug()\n", ""))
+    video = tmp_path / "run.mp4"
+    report = simulate.run(bundle, echo=False, timeout=300, log_dir=tmp_path / "runs",
+                          recording=simulate.Recording(video=video, frames="0,end",
+                                                       frames_dir=tmp_path / "frames", dpi=40))
+    assert report.returncode == 0, report.output
+    assert report.recording_error is None
+    assert sorted(report.stills) == ["end", "t0s"] and report.video == str(video.resolve())
+
+
+FAILING_STILLS = """\
+import os, shutil
+import numpy as np
+import rps.robotarium as robotarium
+r = robotarium.Robotarium(number_of_robots=2, show_figure=False)
+frames = os.environ["ROBOTARIUM_SIM_FRAMES_DIR"]
+for k in range(20):
+    if k == 3:                      # the stills' directory becomes a file mid-run
+        shutil.rmtree(frames)
+        open(frames, "w").close()
+    r.get_poses()
+    r.set_velocities(np.arange(2), np.zeros((2, 2)))
+    r.step()
+print("the run went on")
+r.debug()
+"""
+
+
+@needs_simulator
+def test_a_recording_that_fails_mid_run_is_a_warning_not_a_failed_run(tmp_path):
+    experiment_, bundle = _bundle_of(tmp_path, FAILING_STILLS)
+    report = simulate.run(bundle, echo=False, timeout=300, log_dir=tmp_path / "runs",
+                          recording=simulate.Recording(frames="0,0.2,end",
+                                                       frames_dir=tmp_path / "frames", dpi=40))
+    assert report.returncode == 0 and "the run went on" in report.output, report.output
+    assert "nothing more was recorded" in report.recording_error
+    assert sorted(report.stills) == ["t0s"] and report.frames_missing == []
+    found = report.findings(experiment_)
+    assert levels(found, ERROR) == "" and "Recording: " in levels(found, WARNING)
+
+
+def test_a_recording_that_cannot_be_written_is_refused_before_anything_runs(tmp_path):
+    write(tmp_path / "file", "")
+    with pytest.raises(ValueError, match="Cannot make .*the stills"):
+        simulate.Recording(frames="0,end", frames_dir=tmp_path / "file" / "frames").check()
+    if __import__("shutil").which("ffmpeg"):
+        with pytest.raises(ValueError, match="Cannot make .*the video"):
+            simulate.Recording(video=tmp_path / "file" / "x.mp4").check()
+    made = tmp_path / "new" / "frames"
+    simulate.Recording(frames="0", frames_dir=made).check()
+    assert made.is_dir()
+
+
+@needs_simulator
+def test_a_run_that_fails_before_its_robotarium_wants_no_stills(tmp_path):
+    experiment_, bundle = _bundle_of(tmp_path,
+                                     "import rps.robotarium\nraise RuntimeError('early')\n")
+    report = simulate.run(bundle, echo=False, timeout=300, log_dir=tmp_path / "runs",
+                          recording=simulate.Recording(frames="0,end",
+                                                       frames_dir=tmp_path / "frames"))
+    assert report.returncode == 1 and report.frames_missing == []
+    assert "No still" not in levels(report.findings(experiment_), WARNING)
+
+
+def test_headless_the_per_step_redraw_is_turned_off(monkeypatch):
+    import types
+    from robotarium import _simshim
+    drawn = []
+    canvas = types.SimpleNamespace(draw_idle=lambda: drawn.append("idle"),
+                                   flush_events=lambda: drawn.append("flush"))
+    robotarium = types.SimpleNamespace(_fig=types.SimpleNamespace(canvas=canvas))
+    monkeypatch.setenv("MPLBACKEND", "qtagg")
+    _simshim._quiet_canvas(robotarium)
+    canvas.draw_idle()
+    assert drawn == ["idle"]                 # a window someone watches is left alone
+    monkeypatch.setenv("MPLBACKEND", "Agg")
+    _simshim._quiet_canvas(robotarium)
+    canvas.draw_idle()
+    canvas.flush_events()
+    assert drawn == ["idle"] and canvas._robotarium_quiet

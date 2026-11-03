@@ -286,3 +286,55 @@ def test_auto_declares_the_maximum_and_follows_a_lower_live_one(project, fake_si
     create = next(each["json"] for each in fake_site if each["path"].endswith("create"))
     assert create["estimatedDuration"] == "300"
     assert ledger.read(project.output_dir)[-1]["duration"] == 300
+
+
+def julia_project(tmp_path, startup):
+    write(tmp_path / "main.py", "import rps.robotarium\n")
+    write(tmp_path / "backend.jl", "module Backend\nend\n")
+    return Project(experiment=Experiment(
+        title="T", description="D", duration=120, robots=2, main="main.py",
+        files=["backend.jl"], root=tmp_path, julia_startup=startup))
+
+
+def test_without_a_simulation_the_startup_is_still_checked(tmp_path, fake_site, logged_in):
+    with pytest.raises(SubmissionRefused) as refused:
+        submit(julia_project(tmp_path, "3m"), simulate_first=False, dry_run=True)
+    assert "Julia's startup alone, about 180 s" in str(refused.value)
+    assert FakeRobotarium.requests == []
+    result = submit(julia_project(tmp_path / "fits", 60), simulate_first=False, dry_run=True,
+                    out=lambda text: None)
+    assert not result.sent
+
+
+def test_what_is_sent_is_what_the_plan_showed(project, fake_site, logged_in, monkeypatch):
+    from robotarium import submission
+    shown = []
+    original = submission.prepare
+
+    def prepare(*args, **kwargs):
+        shown.append(original(*args, **kwargs))
+        return shown[-1]
+
+    def rebuilt_meanwhile(text):
+        # Another command rebuilding the bundle while the question is open.
+        main = shown[-1].bundle.main
+        main.write_text(main.read_text() + "\n# changed\n")
+        return True
+
+    monkeypatch.setattr(submission, "prepare", prepare)
+    with pytest.raises(SubmissionRefused, match=r"changed after the plan was shown \(main.py\)"):
+        submit(project, confirm=rebuilt_meanwhile, out=lambda text: None)
+    assert FakeRobotarium.requests == []                    # not even a login
+
+
+def test_a_submit_holds_the_projects_lock(project, fake_site, logged_in):
+    from robotarium import bundle as bundle_module
+    held = []
+
+    def confirm(text):
+        held.extend(bundle_module._HELD)
+        return False
+
+    submit(project, confirm=confirm, out=lambda text: None)
+    assert held == [(project.output_dir / ".lock").resolve()]
+    assert bundle_module._HELD == {}

@@ -92,11 +92,104 @@ def test_the_testbeds_own_timing_comes_first(tmp_path):
     assert budget.startup_estimate(other).source == "assumed"
 
 
-def test_a_stated_startup_beats_every_measurement(tmp_path):
+def test_a_stated_startup_beats_a_cold_start_here(tmp_path):
     found = project(tmp_path, julia_startup=90)
     write_cold_start(found)
+    estimate = budget.startup_estimate(found)
+    assert (estimate.seconds, estimate.source) == (90, "stated")
+
+
+def test_a_testbed_timing_above_the_stated_startup_is_counted_and_warned_about(tmp_path):
+    found = project(tmp_path, julia_startup=100)
+    write_testbed_timing(found)                               # 150 s x 1.1 = 165 s
+    estimate = budget.startup_estimate(found)
+    assert (estimate.source, estimate.seconds) == ("testbed", pytest.approx(165.0))
+    warning, = [each for each in estimate.findings if each.level == WARNING]
+    assert "[julia] startup = 100 is less than the testbed's own timing" in warning.message
+    assert "at least 165" in warning.message
+
+
+def test_a_stated_startup_above_the_testbed_timing_stands(tmp_path):
+    found = project(tmp_path, julia_startup=200)
     write_testbed_timing(found)
-    assert budget.startup_estimate(found).seconds == 90
+    estimate = budget.startup_estimate(found)
+    assert (estimate.source, estimate.seconds) == ("stated", 200)
+    assert [each.level for each in estimate.findings] == [INFO]
+    assert "about 165 s" in estimate.findings[0].message
+
+
+def test_a_cold_start_without_package_servers_is_an_upper_bound(tmp_path):
+    found = project(tmp_path)
+    write_cold_start(found, pkg_server="")
+    estimate = budget.startup_estimate(found)
+    assert (estimate.seconds, estimate.upper_bound) == (200.0, True)   # no margin on it
+    assert "at most about 200 s" in estimate.findings[0].message
+    write_cold_start(found, pkg_server=None)                 # Pkg's own server: x 1.5
+    estimate = budget.startup_estimate(found)
+    assert (estimate.seconds, estimate.upper_bound) == (300.0, False)
+
+
+def test_a_cold_start_with_other_juliacall_than_the_testbeds_is_warned_about(tmp_path):
+    found = project(tmp_path)
+    write_cold_start(found, juliacall="0.9.1", key=budget.project_key(found.experiment,
+                                                                        "0.9.1", "0.1.24"))
+    estimate = budget.startup_estimate(found)
+    assert estimate.source == "cold-start"
+    assert any(each.level == WARNING and "juliacall 0.9.1" in each.message
+               for each in estimate.findings)
+
+
+# ---------------------------------------------------------------------------
+# the duration checks without a simulation
+# ---------------------------------------------------------------------------
+
+def built(found):
+    from robotarium.bundle import build
+    return build(found.experiment, found.output_dir)
+
+
+def messages(findings, level):
+    return " | ".join(each.message for each in findings if each.level == level)
+
+
+def test_a_startup_that_alone_takes_the_duration_is_an_error_without_a_simulation(tmp_path):
+    from robotarium.findings import ERROR
+    found = project(tmp_path, julia_startup="3m")            # 180 s against 120 s
+    text = messages(budget.budget_findings(found, built(found)), ERROR)
+    assert "Julia's startup alone, about 180 s" in text and "120 s declared" in text
+    fits = project(tmp_path / "fits", julia_startup=60)
+    assert messages(budget.budget_findings(fits, built(fits)), ERROR) == ""
+
+
+def test_a_startup_over_the_maximum_is_an_error_under_auto(tmp_path):
+    from robotarium.findings import ERROR
+    found = project(tmp_path, duration="auto", julia_startup=600)
+    assert "over the form's 600 s maximum" in messages(
+        budget.budget_findings(found, built(found)), ERROR)
+
+
+def test_an_upper_bound_alone_is_only_a_warning(tmp_path):
+    from robotarium.findings import ERROR
+    found = project(tmp_path, duration="auto")
+    write_cold_start(found, startup_seconds=700.0, pkg_server="")
+    findings = budget.budget_findings(found, built(found))
+    assert messages(findings, ERROR) == ""
+    assert "at most about 700 s" in messages(findings, WARNING)
+
+
+def test_the_last_simulation_is_judged_with_the_startup(tmp_path):
+    from robotarium import simulate
+    from robotarium.findings import ERROR
+    found = project(tmp_path, duration=120, julia_startup=60)
+    bundle = built(found)
+    report = simulate.SimulationReport(returncode=0, rps="/rps", robots=[2], init_steps=300,
+                                       steps=1500, ended=True)      # 59.4 s of steps
+    simulate.save_last(report, bundle, found.output_dir, found.experiment.load_config())
+    text = messages(budget.budget_findings(found, bundle), ERROR)
+    assert "about 119 s" not in text                          # 60 + 59.4 fits 120 s
+    found.experiment.julia_startup = 90
+    text = messages(budget.budget_findings(found, bundle), ERROR)
+    assert "The run takes about 149 s" in text and "Declare 240" in text
 
 
 def test_the_budget_line_adds_it_up(tmp_path):

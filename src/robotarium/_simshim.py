@@ -34,7 +34,10 @@ creates it. Headless, the figure is drawn only for the frames kept: rps's own pe
 (draw_idle under Agg renders at once, for nobody) is turned off. Time 0 is the experiment's
 first step, after the drive to the initial poses: frame k is taken as step() is called for the
 kth time after the drive, when the robots (drawn at the end of the step before) and whatever
-the main file drew since both show the poses at k x 0.033 s.
+the main file drew since both show the poses at k x 0.033 s; the still reports that step's
+time. The "end" still is taken at r.debug() (or at exit): the robots as the last step left them,
+and what the main file drew before that step, one step behind them. A recording that fails
+stops recording and is reported; it never fails the run.
 """
 
 import atexit
@@ -140,44 +143,79 @@ class Recorder:
         self.robotarium = robotarium
         self.figure = figure
         if self.video_path:
-            runtime = _private_runtime()
-            self.video = runtime.VideoRecorder(figure, self.video_path, fps=self.fps)
+            try:
+                runtime = _private_runtime()
+                self.video = runtime.VideoRecorder(figure, self.video_path, fps=self.fps)
+            except Exception as error:  # noqa: BLE001 -- the stills can still be taken
+                REPORT["recording_error"] = "no video: %s: %s" % (type(error).__name__, error)
+                self.video = None
+                return
             if not self.video.enabled:
                 REPORT["recording_error"] = "ffmpeg is not on PATH, so no video was written"
                 self.video = None
 
     def capture(self, robotarium, step: int) -> None:
-        """What to keep of experiment step `step`, before it is taken."""
+        """
+        What to keep of experiment step `step`, before it is taken. Runs inside the main
+        file's step(), so a recording that fails stops recording and is reported; it never
+        fails the run.
+        """
         if robotarium is not self.robotarium or self.finished:
             return
         self.last = step
-        if self.video is not None and step % self.every == 0:
-            self.video.frame()
-        for seconds in self.stills.pop(step, ()):
-            self._still(_still_label(seconds), seconds)
+        try:
+            if self.video is not None and step % self.every == 0:
+                self.video.frame()
+            for seconds in self.stills.pop(step, ()):
+                self._still(_still_label(seconds), step * STEP_SECONDS)
+        except Exception as error:  # noqa: BLE001 -- see above
+            self._fail(error)
 
     def finish(self) -> None:
-        """The "end" still and the video's last frame, the poses after the last step."""
+        """
+        The "end" still and the video's last frame: the robots as the last step left them,
+        with what the main file drew before that step (one step behind them).
+        """
         if self.finished:
             return
         self.finished = True
+        if self.robotarium is None:
+            return  # no figure, or rps never ran: nothing was due
         steps = REPORT["steps"]
-        if self.robotarium is not None:
+        try:
             if self.end:
                 self._still("end", steps * STEP_SECONDS)
-            if self.video is not None:
-                if self.last is not None:
-                    self.video.frame()  # the poses after the last step
-                try:
-                    path = self.video.close()
-                except RuntimeError as error:
-                    REPORT["recording_error"] = str(error)
-                    path = None
-                REPORT["video"] = str(Path(path).resolve()) if path else None
+            if self.video is not None and self.last is not None:
+                self.video.frame()  # the poses after the last step
+        except Exception as error:  # noqa: BLE001 -- the video is still closed below
+            REPORT["recording_error"] = "%s: %s" % (type(error).__name__, error)
+        finally:
+            self._close_video()
         REPORT["frames_missing"] = sorted(seconds for each in self.stills.values()
                                           for seconds in each)
 
+    def _fail(self, error) -> None:
+        """Stops recording after `error`, keeping what was recorded, and reports it."""
+        REPORT["recording_error"] = "%s: %s; nothing more was recorded" % (
+            type(error).__name__, error)
+        self.finished = True
+        self.stills.clear()
+        self._close_video()
+
+    def _close_video(self) -> None:
+        if self.video is None:
+            return
+        video, self.video = self.video, None
+        try:
+            path = video.close()
+        except Exception as error:  # noqa: BLE001 -- a dead ffmpeg, a full disk
+            REPORT["recording_error"] = REPORT["recording_error"] or "%s: %s" % (
+                type(error).__name__, error)
+            path = None
+        REPORT["video"] = str(Path(path).resolve()) if path else None
+
     def _still(self, label: str, seconds: float) -> None:
+        """A still, saved as label.<format>; `seconds` is its step's time, k x 0.033 s."""
         self.frames_dir.mkdir(parents=True, exist_ok=True)
         path = self.frames_dir / ("%s.%s" % (label, self.format))
         self.figure.savefig(str(path), dpi=self.dpi, facecolor="white")
@@ -408,8 +446,6 @@ def main() -> int:
 
     global RECORDER
     RECORDER = _recorder_from_environment()
-    # Registered after the report, so run before it.
-    atexit.register(finish_recording)
 
     seed = os.environ.get("ROBOTARIUM_SIM_SEED")
     if seed not in (None, ""):
@@ -437,6 +473,10 @@ def main() -> int:
         print("The Robotarium simulator (rps) is not importable: %s" % REPORT["exception"],
               file=sys.stderr)
         return 3
+    # Registered after the report, so run before it; and after install() has imported rps,
+    # and with it pyplot, whose own exit handler closes every figure: handlers run last
+    # registered first, so the "end" still and the video's last frame come before that.
+    atexit.register(finish_recording)
 
     # As `python main.py` would: the main file's directory first on the path, argv[0] the file.
     sys.path.insert(0, str(main_file.parent))

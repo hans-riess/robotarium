@@ -17,6 +17,9 @@ under its base name into one directory, so the bundle is that directory: `robota
 runs the main file from here, and a run that works here has the layout the testbed will give it.
 
 A build is staged and then moved into place, so one that fails leaves the last good bundle.
+There is one bundle directory per project, so a command that builds it and then runs or uploads
+what it built holds the project's lock (locked) from the build to the end: a second command on
+the same project waits, and cannot rebuild the bundle under the first one's run.
 """
 
 import ast
@@ -26,8 +29,11 @@ import importlib.util
 import json
 import logging
 import math
+import os
 import re
 import shutil
+import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -47,6 +53,116 @@ class BundleError(RuntimeError):
         self.findings = findings
         super().__init__("The experiment cannot be bundled:\n  %s"
                          % "\n  ".join(str(each) for each in findings))
+
+
+class BundleLocked(RuntimeError):
+    """Another command held the project's lock past the timeout."""
+
+
+#: Where the lock is kept, in the output directory.
+LOCK_NAME = ".lock"
+
+#: The locks this process holds, by path: [open file, depth], so a holder may lock again.
+_HELD = {}
+
+
+class locked:
+    """
+    Holds the project's lock while the block runs: one command at a time builds, runs and
+    uploads a project's bundle. A command that finds it held says by whom, and waits.
+
+        with locked(project.output_dir):
+            bundle = build(experiment, project.output_dir)
+            ...run or upload it...
+
+    The same process may take it again inside the block. The lock is the operating system's
+    (flock on POSIX, a locked byte on Windows), so a command that dies lets it go.
+
+    Args:
+        output_dir (Path): The project's .robotarium directory.
+        timeout (float): Seconds to wait before giving up (BundleLocked); None to wait on.
+        out: Where to say that it is waiting; default stderr.
+    """
+
+    def __init__(self, output_dir, timeout: float = None, out=None):
+        self.path = (Path(output_dir) / LOCK_NAME).resolve()
+        self.timeout = timeout
+        self.out = out
+
+    def __enter__(self):
+        held = _HELD.get(self.path)
+        if held is not None:
+            held[1] += 1
+            return self
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(self.path, "a+", encoding="utf-8")
+        try:
+            if not _try_lock(handle):
+                handle.seek(0)
+                holder = handle.read().strip() or "another robotarium command"
+                print("Waiting for %s to finish with %s (it holds %s)..."
+                      % (holder, self.path.parent, self.path.name),
+                      file=self.out or sys.stderr, flush=True)
+                waited = time.monotonic()
+                while not _try_lock(handle):
+                    if self.timeout is not None and time.monotonic() - waited > self.timeout:
+                        raise BundleLocked("%s is still held by %s." % (self.path, holder))
+                    time.sleep(0.2)
+            handle.seek(0)
+            handle.truncate()
+            handle.write("pid %d (%s)\n" % (os.getpid(), " ".join(
+                [Path(sys.argv[0]).name] + sys.argv[1:3]) if sys.argv else "python"))
+            handle.flush()
+        except BaseException:
+            handle.close()
+            raise
+        _HELD[self.path] = [handle, 1]
+        return self
+
+    def __exit__(self, *exc):
+        held = _HELD.get(self.path)
+        if held is None:
+            return False
+        held[1] -= 1
+        if held[1] == 0:
+            del _HELD[self.path]
+            _unlock(held[0])
+            held[0].close()
+        return False
+
+
+def _try_lock(handle) -> bool:
+    try:
+        import fcntl
+    except ImportError:
+        fcntl = None
+    try:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        import msvcrt
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        return True
+    except ImportError:
+        return True  # neither: no lock to take here
+    except OSError:
+        return False
+
+
+def _unlock(handle) -> None:
+    try:
+        import fcntl
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except ImportError:
+        try:
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        except (ImportError, OSError):
+            pass
+    except OSError:
+        pass
 
 
 @dataclass

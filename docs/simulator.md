@@ -146,8 +146,15 @@ seconds, plus `end` for the last pose; `--frames-format` is `png` (the default) 
 recorded). A still at T s is taken at step ceil(T / 0.033): 14.5 s is step 440. It is captured
 as `step()` is called, before the step is taken. At that moment the robots (drawn at the end
 of the step before) and whatever the main file drew since, such as a `FloorOverlay`, both show
-the poses at that step's time. `end` is taken at `r.debug()` (or at exit) and shows the poses
-after the last step. A time past the end of the run is a **warning**.
+the poses at that step's time, and the still reports that step's time, k x 0.033 s (a still
+asked for at 0.5 s is step 16, reported as 0.528 s). `end` is taken at `r.debug()` (or at exit)
+and shows the robots after the last step with what the main file drew before that step: the
+overlay is one step behind the robots in it, and a `clock` in it reads one step early. A time
+past the end of the run is a **warning**.
+
+A recording never fails the run. Its directories are made before anything runs, and one that
+cannot be made is an error then. A recording that fails mid-run (a full disk, an ffmpeg that
+died) stops recording, keeps what it has, and is a **warning**; the video is closed either way.
 
 Stills are named `t0s.png`, `t14s.png`, `t14p5s.png` and `end.png`, with no second dot, which
 LaTeX's `\includegraphics` would take for the extension. The command prints each path after
@@ -159,8 +166,15 @@ set before rps creates its figure, since rps takes no dpi. Headless, rps's own p
 is turned off: under Agg, `draw_idle()` renders the whole figure every step, for nobody. Only
 the frames kept are drawn, so a recorded run costs one render per frame. Recording settings
 can also live in `[simulator]` (`video`, `fps`, `every`, `dpi`, `frames`, `frames_dir`,
-`frames_format`); the command line wins. They apply to `robotarium simulate` only, not to the
-simulation `submit` runs.
+`frames_format`); the command line wins, and `robotarium check` refuses a value there that
+`simulate` would. They apply to `robotarium simulate` only, not to the simulation `submit`
+runs.
+
+One project has one bundle directory, so `check`, `bundle`, `simulate`, `submit` and `julia
+check` hold the project's lock (`.robotarium/.lock`) from the build to the end: a second command
+on the same project, such as a `simulate --set` of another variant, waits for the first and
+says so, rather than rebuild the bundle under its run. `submit` also checks, just before it
+logs in, that every file is still the one the plan showed.
 
 ### Drawing on the figure: `FloorOverlay`
 
@@ -182,13 +196,16 @@ for k in range(iterations):
 ```
 
 Each method takes a key: the first call creates the artist, later calls move or restyle it.
-`segment`, `polyline` (a 2 x N array, `closed=`), `ring` (unfilled), `dot`, `arrow` (a zero
-vector hides it), `text` and `clock` draw; `hide`, `show`, `remove`, `clear(prefix)` and `keys`
-act on keys. It never redraws the figure itself; rps's `step()` does. Without a figure
-(`show_figure=False`, or a testbed that draws none), `overlay.enabled` is False, every call
-does nothing, and matplotlib is never imported. An error while drawing turns the overlay off
-with one printed line, rather than stop the robots. The clock lets a still from the testbed's
-own video be matched to the run's time.
+A style argument a call leaves out (`color`, `width`, `style`, `alpha`, a dot's `radius` and
+`filled`, an arrow's `head`, a label's `size`, `ha` and `va`) keeps the key's current value, and
+the first call takes the documented default, so a loop may pass only the geometry once the
+style is set. `segment`, `polyline` (a 2 x N array, `closed=`), `ring` (unfilled), `dot`,
+`arrow` (a zero vector hides it), `text` and `clock` draw; `hide`, `show`, `remove`,
+`clear(prefix)` and `keys` act on keys. It never redraws the figure itself; rps's `step()` does.
+Without a figure (`show_figure=False`, or a testbed that draws none), `overlay.enabled` is
+False, every call does nothing, and matplotlib is never imported. An error while drawing turns
+the overlay off, hides what it drew, and prints one line, rather than stop the robots. The clock
+lets a still from the testbed's own video be matched to the run's time.
 
 ## Reproducible runs: `--seed`
 
@@ -207,7 +224,9 @@ anything it rejects.
 
 `RunLogger` writes into `.robotarium/runs/` during a simulation, rather than into the bundle.
 The copy of each write that it prints for the testbed's `log.txt` shows as one line of output,
-and the Julia timing marker isn't shown (the line before it says the same). Each finished run
+and the Julia timing marker isn't shown (the line before it says the same). A copy that arrives
+without its end line is said to be cut short, and the line that interrupted it is shown as it
+came (see [logging.md](logging.md) on stdout under Julia). Each finished run
 also leaves `.robotarium/runs/last-simulation.json`, its step count and the hashes of the files
 it ran, so `robotarium check` and `robotarium julia check --cold` can show the duration budget
 without simulating again. Read a log back with:

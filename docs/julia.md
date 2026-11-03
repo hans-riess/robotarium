@@ -124,7 +124,9 @@ newer Julia (1.12, 1.13) than the one tested here. `"=1.11.9"` pins one release:
 version = "=1.11.9"
 ```
 
-`robotarium check` warns about a version that isn't an exact pin. juliacall adds its own
+`robotarium check` warns about a version that isn't an exact pin. A hyphen range from a release
+to itself (`"1.11.9 - 1.11.9"`) is one, and so is `"=1.11"`, but Pkg fills in an `=` version's
+missing parts with 0, so that one pins 1.11.0, and the check says so. juliacall adds its own
 bounds: the testbed's juliacall 0.9.35 asks for Julia `^1.10.3`, and with a Python whose
 OpenSSL is older than 3.5 juliapkg also caps it below 1.12, so 1.11.9, the last 1.11 release,
 is the pin that fits.
@@ -138,6 +140,10 @@ flat beside `backend.jl`. Include it by its base name, as every file lands in on
 ```julia
 include(joinpath(@__DIR__, "sheafcore.jl"))
 ```
+
+With several `.jl` files in the bundle, `robotarium julia check` loads `backend.jl`, which is what
+`load_julia_backend()` loads by default and what `include()`s the others, and says so. `--file`
+names another; a bundle with several `.jl` files and no `backend.jl` needs it.
 
 ## Checking it
 
@@ -154,9 +160,11 @@ It also warns about a `[julia] version` that isn't an exact pin (see "Pinning Ju
 directory through the same `robotarium_runtime` code the testbed runs: packages declared, Julia
 started, file included. It then prints the module, what it exports, and how long each step
 took. The first run downloads Julia and the packages into your environment, which takes a few
-minutes. `--call FUNC` also calls a function twice after loading, timing its first call;
-`--set KEY=VALUE` checks a variant's bundle; `--cold` times the whole install from nothing
-(see "Timing a cold start" below).
+minutes. `--call FUNC` also calls a function twice after loading, timing its first call (a name
+given twice, with two payloads, keeps the first call's time); `--set KEY=VALUE` checks a
+variant's bundle; `--file F.jl` picks the file when there are several; `--cold` times the whole
+install from nothing (see "Timing a cold start" below). When it fails, it says whether loading
+the file or a call failed, with Julia's `ERROR:` lines and the exception's own message.
 
 ```bash
 pip install -e ".[julia]"     # in your clone, venv active: juliacall, which brings juliapkg
@@ -188,15 +196,23 @@ The startup figure is the first of these that exists:
 
 | Source | Taken as | How to get it |
 |---|---|---|
+| a timing fetched from the testbed, for the same Julia and packages | x 1.1, or `[julia] startup` when that states more | `robotarium fetch` after a run: `julia_timing.json` |
 | `[julia] startup = 240` (or `"4m"`) | stated | write it in the manifest |
-| a timing fetched from the testbed, for the same Julia and packages | x 1.1 | `robotarium fetch` after a run: `julia_timing.json` |
-| a cold start measured here, for the same Julia and packages | x 1.5 | `robotarium julia check --cold` |
+| a cold start measured here, for the same Julia and packages | x 1.5; as measured, and as an upper bound, when Julia's package servers were off | `robotarium julia check --cold` |
 | nothing | 180 s, with a warning | |
 
-"The same Julia and packages" is a key: a sha256 of `[julia] version`, the packages, and the
-juliacall and juliapkg versions. A timing of other packages isn't used. Under `"auto"`, the
-default, the form's maximum of 600 s is declared, and the assumed figure is only a note; the
-checks warn when startup and run come within 60 s of 600 s, and refuse past it.
+A fetched testbed timing replaces a smaller `[julia] startup`, with a warning to raise it, so a
+manifest that states `"3m"` before the first hardware run still follows what the testbed
+measured afterwards; a larger stated figure stands. "The same Julia and packages" is a key: a
+sha256 of `[julia] version`, the packages, and the juliacall and juliapkg versions. A timing of
+other packages isn't used. Under `"auto"`, the default, the form's maximum of 600 s is declared,
+and the assumed figure is only a note; the checks warn when startup and run come within 60 s of
+600 s, and refuse past it.
+
+`check`, and a `submit` that does not simulate, make the same checks from the last simulation
+of the same files and config (`.robotarium/runs/last-simulation.json`). Without one they still
+refuse a startup that alone takes the whole of a fixed duration, or more than 600 s under
+`"auto"` or `"measured"`: the steps can only add to it. An upper bound (below) only warns.
 
 ### Timing a cold start: `robotarium julia check --cold`
 
@@ -208,10 +224,15 @@ robotarium julia check --cold --cpus 2 --call build_operators --call 'probe={"ro
 
 `--cold` runs the same load as `julia check` in a scratch Julia depot (`JULIA_DEPOT_PATH`),
 juliapkg project (`PYTHON_JULIAPKG_PROJECT`) and juliaup depot, with no `julia` or `juliaup`
-on `PATH`, so nothing installed here is found. `JULIA_PKG_SERVER`, `JULIA_PKG_USE_CLI_GIT`,
-proxies and CA bundles pass through, since a machine that needs them to reach the package
-servers needs them for a cold start too. The output streams with the time of each line, and
-juliapkg's and Pkg's own lines split it into phases:
+on `PATH`, so nothing installed here is found. The depot path ends in a separator, which Julia
+reads as "then the depots bundled with Julia": they hold the precompiled standard libraries,
+which a Julia installed on the testbed has too, and without them loading Pkg alone compiles it
+for about two minutes. `~/.julia` is not among them. A `PATH` directory that holds `julia` or
+`juliaup` is replaced by one of links to everything else in it, so `git` and the rest stay
+found. `JULIA_PKG_SERVER`, `JULIA_PKG_USE_CLI_GIT`, proxies and CA bundles pass through, since a
+machine that needs them to reach the package servers needs them for a cold start too. The
+output streams with the time of each line, and juliapkg's and Pkg's own lines split it into
+phases:
 
 ```
 Cold start of backend.jl (Julia 1.11.9, 4 CPUs): 576 s in all
@@ -223,25 +244,31 @@ Cold start of backend.jl (Julia 1.11.9, 4 CPUs): 576 s in all
   include backend.jl                  5.6 s
   first probe()                      14.0 s   (then 0.001 s warm)
   ready, after                      575.6 s
+  Julia's package servers were off (JULIA_PKG_SERVER is empty), so every package came as a git clone:
+  far slower than the testbed's install, so the budget counts this as an upper bound.
 Saved .robotarium/julia/cold-start.json
 
-Budget: 863 s Julia startup (576 s cold here x 1.5) + 17 s robots (527 steps) = 881 s, with the duration "measured": 600 s would be declared, and the form's maximum is 600 s.
+Budget: 576 s Julia startup (576 s cold here, by git clone, at most) + 17 s robots (527 steps) = 593 s, with the duration "measured": 600 s would be declared.
 ```
 
 That run loaded CellularSheaves.jl 0.1.0 with JSON3 and Graphs, on a machine whose network
 reaches GitHub but not Julia's package servers (`JULIA_PKG_SERVER=""`, so the registry and every
-package came as git clones). Where the package servers are reachable, as on the testbed,
-downloads are much faster: robosheaf's testbed run began to move after about 171 s. A cold
-start measured here is then an upper bound, and `[julia] startup` states a better figure until
-a testbed timing has been fetched.
+package came as git clones), and before the depot path kept Julia's bundled depots, which cost it
+about 100 s of compiling Pkg. Where the package servers are reachable, as on the testbed,
+downloads are much faster: robosheaf's testbed run began to move after about 171 s.
+`cold-start.json` records `JULIA_PKG_SERVER` (`"pkg_server"`), and a cold start measured with
+it empty is taken as it is, with no margin, as an upper bound: the duration checks warn, rather
+than refuse, where it alone would push the run past a limit. `[julia] startup` states a better
+figure until a testbed timing has been fetched. A record made with another juliacall or
+juliapkg than the testbed's is still used, with a warning to measure again.
 
 | Option | Meaning |
 |---|---|
 | `--keep-julia` | point juliapkg at the Julia installed here (`PYTHON_JULIAPKG_EXE`) rather than download one |
 | `--cpus N` | precompile with N tasks (`JULIA_NUM_PRECOMPILE_TASKS`), as a smaller machine would |
 | `--call FUNC[=JSON]` | after loading, call `FUNC` twice through `call_json` (with `{}` or the JSON given): the first call compiles it |
-| `--scratch DIR` | install into DIR, which must be empty or new, rather than a temporary directory |
-| `--keep-scratch` | leave the scratch directory in place afterwards |
+| `--scratch DIR` | install into DIR, which must be empty or new, rather than a temporary directory; afterwards what was installed is deleted, and DIR too unless it was there before |
+| `--keep-scratch` | leave the scratch directory as it is afterwards |
 | `--timeout S` | give up after S seconds (default 3600) |
 
 The first call of each function matters: a package without a precompile workload, as
@@ -269,11 +296,13 @@ packages), starting Julia, the `include`, and the first `call_json` of each func
 ```
 
 They are printed into the run's output as one readable line and one marker line,
-`-----ROBOTARIUM TIMING {json}-----`, once when the backend has loaded and again, with the first
-calls, at the first `RunLogger` save. `RunLogger` keeps them in its record's meta as
-`"julia"`. `robotarium fetch` reads the last marker out of `log.txt` into
+`-----ROBOTARIUM TIMING {json}-----`, once when the backend has loaded and again right after
+each function's first `call_json`, so a run the testbed stops early still leaves them in
+`log.txt`. The marker leaves out `packages` and `platform`, which the key stands for, to stay one
+short line. `RunLogger` keeps the whole of `julia_timings()` in its record's meta as `"julia"`.
+`robotarium fetch` reads the last marker out of `log.txt` into
 `.robotarium/results/<id>/julia_timing.json`, which the budget then prefers to any local
-measurement.
+measurement (and to a smaller `[julia] startup`).
 
 ## The CONFIG pattern, for comparison
 

@@ -84,33 +84,55 @@ def _version_key(version: str):
 
 
 #: Run in the bundle directory by check(): the testbed's own load path, then each --call twice
-#: (the first compiles it), then a report.
+#: (the first compiles it), then a report. A failure is reported on its own line, saying whether
+#: loading or a call failed, and with the exception's own message.
 _CHECK_SCRIPT = r"""
-import json, sys, time
+import json, sys, time, traceback
 started = time.monotonic()
-import robotarium_runtime as runtime
-backend = runtime.load_julia_backend(sys.argv[1])
-from juliacall import Main as jl
-names = [str(each) for each in jl.names(backend)] if backend is not jl else []
+
+def fail(stage, name=None):
+    error = sys.exc_info()[1]
+    traceback.print_exc()
+    lines = [line for line in str(error).splitlines() if line.strip()]
+    print("ROBOTARIUM_JULIA_CHECK_FAILED " + json.dumps({
+        "stage": stage, "function": name, "type": type(error).__name__,
+        "message": lines[:4]}), flush=True)
+    sys.exit(1)
+
+try:
+    import robotarium_runtime as runtime
+    backend = runtime.load_julia_backend(sys.argv[1])
+    from juliacall import Main as jl
+    names = [str(each) for each in jl.names(backend)] if backend is not jl else []
+except Exception:
+    fail("load")
 calls = json.loads(sys.argv[2]) if len(sys.argv) > 2 else []
 first, warm = {}, {}
 for name, payload in calls:
-    function = getattr(backend, name)
-    clock = time.monotonic()
-    runtime.call_json(function, payload)
-    first[name] = round(time.monotonic() - clock, 3)
+    try:
+        function = getattr(backend, name)
+        clock = time.monotonic()
+        runtime.call_json(function, payload)
+    except Exception:
+        fail("call", name)
+    # A name called twice (with two payloads) keeps its first call's time: that one compiled.
+    first.setdefault(name, round(time.monotonic() - clock, 3))
 ready = round(time.monotonic() - started, 3)
 for name, payload in calls:
-    function = getattr(backend, name)
-    clock = time.monotonic()
-    runtime.call_json(function, payload)
-    warm[name] = round(time.monotonic() - clock, 3)
+    try:
+        function = getattr(backend, name)
+        clock = time.monotonic()
+        runtime.call_json(function, payload)
+    except Exception:
+        fail("call", name)
+    warm.setdefault(name, round(time.monotonic() - clock, 3))
 print("ROBOTARIUM_JULIA_CHECK " + json.dumps({
     "module": str(backend), "names": names, "timings": runtime.julia_timings(),
     "first_calls": first, "warm_calls": warm, "ready_seconds": ready}), flush=True)
 """
 
 _RESULT_PREFIX = "ROBOTARIUM_JULIA_CHECK "
+_FAILED_PREFIX = "ROBOTARIUM_JULIA_CHECK_FAILED "
 
 #: Variables a cold start must not inherit: each points Julia or juliapkg at what is already
 #: installed here. Proxies, CA bundles, JULIA_PKG_SERVER and the like pass through, since a
@@ -161,14 +183,15 @@ def check(bundle, julia_file: str = None, python: str = None, timeout: float = 1
 
     Args:
         bundle (Bundle): A built bundle that carries robotarium_runtime.py.
-        julia_file (str): Which .jl to load; default the bundle's only one.
+        julia_file (str): Which .jl to load; default the bundle's only one, or its
+            backend.jl (see julia_file_for).
         python (str): The interpreter, which needs juliacall; default this one.
         timeout (float): Seconds before giving up.
         calls: (name, payload) pairs (see parse_call) to call after loading, twice each.
         environment (dict): The run's environment; default this one's, without the login.
         echo (bool): Print the output as it comes, each line stamped with its time.
     """
-    julia_file = _julia_file(bundle, julia_file)
+    julia_file = julia_file_for(bundle, julia_file)[0]
     if environment is None:
         environment = {key: value for key, value in os.environ.items()
                        if key not in (USERNAME_VARIABLE, PASSWORD_VARIABLE)}
@@ -204,24 +227,66 @@ def check(bundle, julia_file: str = None, python: str = None, timeout: float = 1
             return result
     output = [line for _, line in transcript]
     # Julia's own "ERROR:" lines say what went wrong; the Python traceback after them only
-    # says where it was noticed.
+    # says where it was noticed, and its last line, the exception, says what was raised.
     julia_errors = [line for line in output if line.startswith("ERROR:")]
-    last = [line for line in output if line.strip()][-1:] or ["no output"]
-    raise JuliaToolError("Loading %s failed:\n  %s" % (
-        julia_file, "\n  ".join(julia_errors + last)))
+    failed = None
+    for line in output:
+        if line.startswith(_FAILED_PREFIX):
+            try:
+                failed = json.loads(line[len(_FAILED_PREFIX):])
+            except ValueError:
+                pass
+    if failed is None:
+        last = [line for line in output if line.strip()][-1:] or ["no output"]
+        raise JuliaToolError("Loading %s failed (exit %s):\n  %s" % (
+            julia_file, process.returncode, "\n  ".join(julia_errors + last)))
+    message = failed.get("message") or [""]
+    cause = ["%s: %s" % (failed.get("type"), message[0])] + message[1:]
+    if failed.get("stage") == "call":
+        what = "%s loaded, but calling %s() failed" % (julia_file, failed.get("function"))
+    else:
+        what = "Loading %s failed" % julia_file
+    raise JuliaToolError("%s:\n  %s" % (what, "\n  ".join(
+        julia_errors + [line for line in cause if line not in julia_errors])))
 
 
-def _julia_file(bundle, julia_file):
+#: The file `julia check` loads when the bundle has several .jl files and --file names none:
+#: load_julia_backend()'s own default.
+DEFAULT_FILE = "backend.jl"
+
+
+def julia_file_for(bundle, julia_file: str = None) -> tuple:
+    """
+    Which of the bundle's .jl files `julia check` loads, as (name, note): the one --file names
+    (by base name, since the bundle is flat), else the only one, else backend.jl, which is what
+    load_julia_backend() loads by default; the others are then what it include()s. note says
+    why, when the choice was not the only file or the one named; else None.
+
+    Args:
+        bundle (Bundle): A built bundle that carries robotarium_runtime.py.
+        julia_file (str): --file, or None.
+    """
     julia_files = [path.name for path in bundle.files if path.suffix == ".jl"]
-    if julia_file is None:
-        if len(julia_files) != 1:
-            raise JuliaToolError("The bundle has %s; name the one to load."
-                                 % (", ".join(julia_files) or "no .jl file"))
-        julia_file = julia_files[0]
+    note = None
+    if julia_file is not None:
+        name = Path(julia_file).name
+        if name not in julia_files:
+            raise JuliaToolError("%s is not in the bundle, which has %s." % (
+                name, ", ".join(julia_files) or "no .jl file"))
+    elif len(julia_files) == 1:
+        name = julia_files[0]
+    elif DEFAULT_FILE in julia_files:
+        name = DEFAULT_FILE
+        note = ("the bundle has %s; %s is loaded, as load_julia_backend() loads it by default, "
+                "and --file names another" % (", ".join(julia_files), DEFAULT_FILE))
+    else:
+        raise JuliaToolError("The bundle has %s; name the one to load with --file." % (
+            ", ".join(julia_files) + (" and no %s" % DEFAULT_FILE) if julia_files
+            else "no .jl file"))
     if not (bundle.directory / "robotarium_runtime.py").is_file():
         raise JuliaToolError("The bundle does not carry robotarium_runtime.py: import it from "
                              "the main file, or set [experiment] runtime = true.")
-    return julia_file
+    return name, note
 
 
 def _stamped(stream, transcript: list, started: float, echo: bool) -> None:
@@ -230,7 +295,7 @@ def _stamped(stream, transcript: list, started: float, echo: bool) -> None:
         text = _ANSI.sub("", line.rstrip("\r\n"))
         seconds = time.monotonic() - started
         transcript.append((round(seconds, 3), text))
-        if echo and not text.startswith(_RESULT_PREFIX):
+        if echo and not text.startswith((_RESULT_PREFIX, _FAILED_PREFIX)):
             try:
                 sys.stdout.write("[%7.1f s] %s\n" % (seconds, text))
                 sys.stdout.flush()
@@ -245,6 +310,13 @@ def cold_environment(scratch: Path, keep_julia: bool = False, cpus: int = None,
     depot of its own, and no julia or juliaup on PATH, so nothing installed here is found.
     juliapkg reads these once, when it is imported, so they are set for the child process.
 
+    The depot path ends in a separator, which Julia reads as "then the depots bundled with
+    Julia itself": those hold the precompiled standard libraries, which a Julia installed on
+    the testbed has too (without them, loading Pkg alone compiles it for minutes). ~/.julia is
+    not among them. A PATH directory that holds julia or juliaup is replaced by a directory
+    of links to everything else in it, so git (which Pkg runs when JULIA_PKG_USE_CLI_GIT is
+    set), ffmpeg and the rest stay on PATH.
+
     Args:
         scratch (Path): An empty directory for all of it.
         keep_julia (bool): Use the Julia installed here (PYTHON_JULIAPKG_EXE) rather than
@@ -258,18 +330,47 @@ def cold_environment(scratch: Path, keep_julia: bool = False, cpus: int = None,
                    if key not in (USERNAME_VARIABLE, PASSWORD_VARIABLE)
                    and key not in _WARM_VARIABLES}
     scratch = Path(scratch).resolve()
-    environment["JULIA_DEPOT_PATH"] = str(scratch / "depot")
+    environment["JULIA_DEPOT_PATH"] = str(scratch / "depot") + os.pathsep
     environment["PYTHON_JULIAPKG_PROJECT"] = str(scratch / "project")
     environment["JULIAUP_DEPOT_PATH"] = str(scratch / "juliaup")
-    names = ("julia", "julia.exe", "juliaup", "juliaup.exe")
-    environment["PATH"] = os.pathsep.join(
-        directory for directory in environment.get("PATH", "").split(os.pathsep)
-        if directory and not any((Path(directory) / name).exists() for name in names))
+    environment["PATH"] = _path_without_julia(environment.get("PATH", ""), scratch / "path")
     if cpus:
         environment["JULIA_NUM_PRECOMPILE_TASKS"] = str(int(cpus))
     if keep_julia:
         environment["PYTHON_JULIAPKG_EXE"] = local_julia(python, base)
     return environment
+
+
+#: What a cold start must not find on PATH.
+_JULIA_NAMES = ("julia", "julia.exe", "juliaup", "juliaup.exe", "julialauncher",
+                "julialauncher.exe")
+
+
+def _path_without_julia(path: str, links: Path) -> str:
+    """
+    PATH with each directory that holds julia or juliaup replaced by links/<n>/, which links
+    to everything else in it; where links cannot be made, the directory is left out.
+    """
+    kept = []
+    for number, directory in enumerate(each for each in path.split(os.pathsep) if each):
+        try:
+            entries = sorted(os.listdir(directory))
+        except OSError:
+            kept.append(directory)  # not there, or not readable: nothing found in it either
+            continue
+        if not any(name.lower() in _JULIA_NAMES for name in entries):
+            kept.append(directory)
+            continue
+        shadow = links / str(number)
+        try:
+            shadow.mkdir(parents=True, exist_ok=True)
+            for name in entries:
+                if name.lower() not in _JULIA_NAMES:
+                    (shadow / name).symlink_to(Path(directory) / name)
+        except OSError:
+            continue  # no symlinks here (Windows without the privilege): leave it out
+        kept.append(str(shadow))
+    return os.pathsep.join(kept)
 
 
 def local_julia(python: str = None, base: dict = None) -> str:
@@ -354,26 +455,31 @@ def cold_check(bundle, experiment, output_dir, julia_file: str = None, python: s
         keep_julia (bool): Reuse the Julia installed here instead of downloading one.
         cpus (int): Precompile with this many tasks.
         scratch (Path): An empty directory to install into; default a temporary one.
-        keep_scratch (bool): Leave scratch in place afterwards, rather than delete it.
+        keep_scratch (bool): Leave scratch in place afterwards. Otherwise what was installed
+            is deleted, and the directory too unless it was there before.
         echo (bool): Print the output as it comes, stamped with its time.
     """
     from robotarium_runtime import julia_key
 
+    julia_file = julia_file_for(bundle, julia_file)[0]
+    # A directory that was there before is emptied afterwards, not removed: it is someone's.
+    existed = False
     if scratch is None:
         scratch = Path(tempfile.mkdtemp(prefix="robotarium-julia-cold-"))
     else:
         scratch = Path(scratch).resolve()
-        if scratch.exists() and any(scratch.iterdir()):
+        existed = scratch.exists()
+        if existed and any(scratch.iterdir()):
             raise JuliaToolError("%s is not empty, so a start there would not be cold. Name an "
                                  "empty or new directory." % scratch)
         scratch.mkdir(parents=True, exist_ok=True)
+    environment = cold_environment(scratch, keep_julia=keep_julia, cpus=cpus, python=python)
     try:
-        environment = cold_environment(scratch, keep_julia=keep_julia, cpus=cpus, python=python)
         result = check(bundle, julia_file, python=python, timeout=timeout, calls=calls,
                        environment=environment, echo=echo)
     finally:
         if not keep_scratch:
-            shutil.rmtree(scratch, ignore_errors=True)
+            _empty(scratch, remove=not existed)
 
     timings = result.get("timings") or {}
     found = phases(result["transcript"])
@@ -383,13 +489,17 @@ def cold_check(bundle, experiment, output_dir, julia_file: str = None, python: s
         "measured_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
         "key": julia_key(experiment.julia_version, packages, juliacall_version,
                          juliapkg_version),
-        "file": _julia_file(bundle, julia_file),
+        "file": julia_file,
         "julia": experiment.julia_version,
         "julia_version": timings.get("julia_version"),
         "packages": packages,
         "juliacall": juliacall_version,
         "juliapkg": juliapkg_version,
         "keep_julia": bool(keep_julia),
+        # "" is Julia's package servers turned off, every package a git clone: far slower
+        # than the testbed's install, so the estimate takes the result as an upper bound.
+        # None is Pkg's default server.
+        "pkg_server": environment.get("JULIA_PKG_SERVER"),
         "precompile_tasks": cpus,
         "cpus": os.cpu_count(),
         "platform": platform.platform(),
@@ -409,6 +519,25 @@ def cold_check(bundle, experiment, output_dir, julia_file: str = None, python: s
     record["path"] = str(path)
     record["module"], record["names"] = result.get("module"), result.get("names")
     return record
+
+
+def _empty(directory: Path, remove: bool) -> None:
+    """Deletes what is in `directory`, and the directory itself when `remove`."""
+    if remove:
+        shutil.rmtree(directory, ignore_errors=True)
+        return
+    try:
+        entries = list(directory.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.rmtree(entry, ignore_errors=True)
+        else:
+            try:
+                entry.unlink()
+            except OSError:
+                pass
 
 
 def describe_cold_start(record: dict) -> str:
@@ -436,4 +565,8 @@ def describe_cold_start(record: dict) -> str:
     for name, seconds, note in rows:
         shown = "%8.1f s" % seconds if seconds is not None else "       - "
         lines.append("  %-30s %s%s" % (name, shown, "   (%s)" % note if note else ""))
+    if record.get("pkg_server") == "":
+        lines.append("  Julia's package servers were off (JULIA_PKG_SERVER is empty), so every "
+                     "package came as a git clone:\n  far slower than the testbed's install, "
+                     "so the budget counts this as an upper bound.")
     return "\n".join(lines)

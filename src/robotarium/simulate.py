@@ -126,6 +126,11 @@ def recording_stem(output_dir, title: str, when: datetime.datetime = None) -> Pa
     return Path(output_dir) / "runs" / ("%s_%s" % (slug(title), when.strftime("%Y%m%d_%H%M%S")))
 
 
+def _setting(name: str) -> str:
+    """A recording setting as both places name it: --frames-dir, [simulator] frames_dir."""
+    return "--%s ([simulator] %s)" % (name.replace("_", "-"), name)
+
+
 @dataclass
 class Recording:
     """
@@ -162,16 +167,17 @@ class Recording:
             raise ValueError("The video is written as an .mp4, so name one, not %s. (Give the "
                              "project before --video, not after it.)" % self.video)
         if self.frames_format not in FRAME_FORMATS:
-            raise ValueError("Stills are %s, not %s." % (" or ".join(FRAME_FORMATS),
-                                                         self.frames_format))
+            raise ValueError("Stills (--frames-format, [simulator] frames_format) are %s, not "
+                             "%s." % (" or ".join(FRAME_FORMATS), self.frames_format))
         for name, value in (("every", self.every), ("dpi", self.dpi)):
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-                raise ValueError("--%s must be a whole number of at least 1, not %r."
-                                 % (name, value))
+                raise ValueError("%s must be a whole number of at least 1, not %r."
+                                 % (_setting(name), value))
         if self.fps is None:
             self.fps = max(1, int(round(1 / (limits.STEP_SECONDS * self.every))))
         if isinstance(self.fps, bool) or not isinstance(self.fps, int) or self.fps < 1:
-            raise ValueError("--fps must be a whole number of at least 1, not %r." % (self.fps,))
+            raise ValueError("%s must be a whole number of at least 1, not %r."
+                             % (_setting("fps"), self.fps))
         if self.frames and self.frames_dir is None:
             raise ValueError("Stills need a directory to go to (--frames-dir).")
 
@@ -180,11 +186,25 @@ class Recording:
         return bool(self.video or self.frames)
 
     def check(self) -> None:
-        """Refuses, before anything runs, a recording that cannot be made here."""
+        """
+        Refuses, before anything runs, a recording that cannot be made here, and makes the
+        directories it writes to: a recording that fails mid-run would otherwise cost the run.
+        """
         if self.video and shutil.which("ffmpeg") is None:
             raise ValueError("--video needs ffmpeg, and it is not on PATH. Install it (apt "
                              "install ffmpeg, brew install ffmpeg), or leave out --video: "
                              "stills (--frames) need no ffmpeg.")
+        if self.video and self.video.is_dir():
+            raise ValueError("The video %s is a directory; name an .mp4 file." % self.video)
+        for what, directory in (("the video", self.video.parent if self.video else None),
+                                ("the stills", self.frames_dir if self.frames else None)):
+            if directory is None:
+                continue
+            try:
+                directory.mkdir(parents=True, exist_ok=True)
+            except OSError as error:
+                raise ValueError("Cannot make %s, the directory for %s: %s."
+                                 % (directory, what, error.strerror or error)) from None
 
     def environment(self) -> dict:
         """The variables that tell the shim what to record."""
@@ -250,7 +270,7 @@ class SimulationReport:
         """suggested_duration, with `startup` seconds of Julia before the first step."""
         return limits.suggested_duration(self.total_steps, extra_seconds=startup or 0)
 
-    def findings(self, experiment=None, startup: float = None) -> list:
+    def findings(self, experiment=None, startup: float = None, upper_bound: bool = False) -> list:
         """
         The run's verdict as Findings, against the experiment's form fields when given.
 
@@ -258,6 +278,8 @@ class SimulationReport:
             experiment (Experiment): What the form will say; None to judge the run alone.
             startup (float): Seconds the testbed takes to start Julia before the first step
                 (budget.startup_estimate); None or 0 for a run without Julia.
+            upper_bound (bool): The startup is at most that (StartupEstimate.upper_bound), so
+                what it alone pushes past a limit is a WARNING, not an ERROR.
         """
         findings = []
         add = findings.append
@@ -334,10 +356,11 @@ class SimulationReport:
                                  self.startup_seconds or 0)))
         # A run cut short says nothing about how long the whole one takes.
         if self.total_steps and not (self.timed_out or self.too_long):
-            findings.extend(self.duration_findings(experiment, float(startup or 0)))
+            findings.extend(self.duration_findings(experiment, float(startup or 0),
+                                                   upper_bound=upper_bound))
         return findings
 
-    def duration_findings(self, experiment, startup: float) -> list:
+    def duration_findings(self, experiment, startup: float, upper_bound: bool = False) -> list:
         """
         Whether startup + drive + steps fit the declared duration, as Findings: the part of
         findings() that `robotarium check` also makes from the last simulation.
@@ -345,44 +368,59 @@ class SimulationReport:
         Args:
             experiment (Experiment): Its duration; None to judge against the form's maximum.
             startup (float): Seconds of Julia startup before the first step; 0 for none.
+            upper_bound (bool): The startup is at most that; see findings().
         """
         findings = []
         add = findings.append
         total = self.testbed_seconds + startup
         suggested = self.suggested(startup)
+        about = "at most about" if upper_bound else "about"
         if startup:
             add(Finding(INFO, "%d steps (%d driving to the initial poses): about %.0f s on the "
-                              "testbed, after about %.0f s of Julia startup: %.0f s in all. "
+                              "testbed, after %s %.0f s of Julia startup: %.0f s in all. "
                               "Suggested estimated duration: %d s."
                               % (self.total_steps, self.init_steps, self.testbed_seconds,
-                                 startup, total, suggested)))
+                                 about, startup, total, suggested)))
         else:
             add(Finding(INFO, "%d steps (%d driving to the initial poses): about %.0f s on the "
                               "testbed. Suggested estimated duration: %d s."
                               % (self.total_steps, self.init_steps, self.testbed_seconds,
                                  suggested)))
         duration = getattr(experiment, "duration", None)
-        if isinstance(duration, int) and not isinstance(duration, bool) and total > duration:
-            add(Finding(ERROR, "The run takes about %.0f s on the testbed%s, and the form "
-                               "would declare %d s; the testbed stops a run that outlasts "
-                               "its declared duration. Declare %d, or \"auto\" (the "
-                               "form's maximum)."
-                               % (total, " (%.0f s of Julia startup, then %.0f s of steps)"
-                                  % (startup, self.testbed_seconds) if startup else "",
-                                  duration, suggested)))
+        fixed = isinstance(duration, int) and not isinstance(duration, bool)
+        # What the startup alone pushes over a limit is only as sure as the startup is.
+        by_startup = WARNING if upper_bound else ERROR
+        if fixed and total > duration:
+            if total > limits.MAX_DURATION_SECONDS:
+                advice = ("No declared duration fits it: the form's maximum is %d s, so the "
+                          "run%s has to be shorter." % (limits.MAX_DURATION_SECONDS,
+                                                        " or the Julia startup" if startup
+                                                        else ""))
+            else:
+                advice = "Declare %d, or \"auto\" (the form's maximum)." % suggested
+            add(Finding(ERROR if self.testbed_seconds > duration else by_startup,
+                        "The run takes %s %.0f s on the testbed%s, and the form would declare "
+                        "%d s; the testbed stops a run that outlasts its declared duration. %s"
+                        % (about if startup else "about", total,
+                           " (%.0f s of Julia startup, then %.0f s of steps)"
+                           % (startup, self.testbed_seconds) if startup else "",
+                           duration, advice)))
         if self.testbed_seconds > limits.MAX_DURATION_SECONDS:
             add(Finding(ERROR, "About %.0f s is over the form's %d s maximum."
                                % (self.testbed_seconds, limits.MAX_DURATION_SECONDS)))
-        elif startup and total > limits.MAX_DURATION_SECONDS and not isinstance(duration, int):
-            add(Finding(ERROR, "With about %.0f s of Julia startup first, the run takes about "
-                               "%.0f s: over the form's %d s maximum, so the testbed would stop "
-                               "it before the end." % (startup, total,
-                                                       limits.MAX_DURATION_SECONDS)))
+        elif startup and total > limits.MAX_DURATION_SECONDS and not fixed:
+            add(Finding(by_startup, "With %s %.0f s of Julia startup first, the run takes %s "
+                                    "%.0f s: over the form's %d s maximum, so the testbed would "
+                                    "stop it before the end. No declared duration fits it; the "
+                                    "run or the startup has to be shorter."
+                                    % (about, startup, about, total,
+                                       limits.MAX_DURATION_SECONDS)))
         elif startup and duration == "auto" and total > limits.AUTO_WARNING_SECONDS:
-            add(Finding(WARNING, "With about %.0f s of Julia startup first, the run takes about "
+            add(Finding(WARNING, "With %s %.0f s of Julia startup first, the run takes %s "
                                  "%.0f s of the %d s that \"auto\" declares; a slower start on "
                                  "the testbed would cut it off." % (
-                                     startup, total, limits.MAX_DURATION_SECONDS)))
+                                     about, startup, about, total,
+                                     limits.MAX_DURATION_SECONDS)))
         return findings
 
     def _loop_findings(self) -> list:
@@ -605,8 +643,23 @@ def _relay(stream, tail, echo: bool) -> None:
     the end whatever the console does, since the run blocks once the pipe is full. The copy of
     its file a RunLogger prints for the testbed's log.txt is shown as one line, not as base64,
     and the Julia timing marker (for log.txt too) not at all: the line before it says the same.
+
+    A copy whose base64 stops before its end line was cut short on its way out (a
+    robotarium_runtime that predates _emit, under a Julia that made stdout non-blocking, lost
+    the rest of it): that is said, and the line that interrupted it is shown as it came.
     """
     copying = None
+
+    def show(text):
+        nonlocal echo
+        tail.append(text)
+        if echo:
+            try:
+                sys.stdout.write(text)
+                sys.stdout.flush()
+            except (OSError, ValueError, UnicodeError):
+                echo = False
+
     for line in stream:
         text = line.strip()
         if TIMING.match(text):
@@ -617,18 +670,15 @@ def _relay(stream, tail, echo: bool) -> None:
                 continue
             if BASE64_LINE.match(text):
                 continue
+            show("(... the copy of %s was cut short: its end never arrived, so `robotarium "
+                 "fetch` cannot rebuild the file from this copy)\n" % copying)
+            copying = None
         begun = COPY_BEGIN.match(text)
         if begun:
             copying = begun.group(1)
             line = "(a copy of %s, %.1f KB, printed for the testbed's log.txt)\n" % (
                 copying, int(begun.group(2)) / 1e3)
-        tail.append(line)
-        if echo:
-            try:
-                sys.stdout.write(line)
-                sys.stdout.flush()
-            except (OSError, ValueError, UnicodeError):
-                echo = False
+        show(line if line.endswith("\n") else line + "\n")
 
 
 def _interrupt(process) -> None:

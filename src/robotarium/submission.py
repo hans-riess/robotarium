@@ -23,7 +23,7 @@ from pathlib import Path
 
 from . import budget, ledger, libraries, preflight, simulate
 from . import credentials as credentials_module
-from .bundle import Bundle, build
+from .bundle import Bundle, build, locked, sha256
 from .client import (DASHBOARD_URL, RobotariumClient, RobotariumError, check_against_settings,
                      experiment_form)
 from .experiment import Experiment, Project
@@ -48,6 +48,7 @@ class Prepared:
     bundle: Bundle
     findings: list
     report: object = None
+    hashes: dict = None
 
 
 @dataclass
@@ -116,6 +117,7 @@ def prepare(target, simulate_first: bool = None, echo: bool = True,
             or experiment.duration == "measured":
         estimate = budget.startup_estimate(project, bundle)
         startup = estimate.seconds if estimate else None
+        upper_bound = bool(estimate and estimate.upper_bound)
         report = simulate.run(bundle, simulator=project.simulator_path,
                               fast=project.simulator_fast, headless=project.simulator_headless,
                               timeout=project.simulator_timeout,
@@ -131,15 +133,18 @@ def prepare(target, simulate_first: bool = None, echo: bool = True,
                 experiment = dataclasses.replace(experiment,
                                                  duration=report.suggested(startup))
                 bundle = build(experiment, project.output_dir, when=when)
-        findings.extend(report.findings(experiment, startup=startup))
+        findings.extend(report.findings(experiment, startup=startup, upper_bound=upper_bound))
         if estimate:
             findings.extend(estimate.findings)
+    else:
+        # No simulation now: the last one of these files and config, or the startup alone.
+        findings.extend(budget.budget_findings(project, bundle))
 
     findings.extend(experiment.check())
     environment = libraries.load(libraries_file, simulator_path=project.simulator_path)
     findings.extend(preflight.check(bundle.files, experiment, environment))
     return Prepared(project=project, experiment=experiment, bundle=bundle,
-                    findings=ordered(_unique(findings)), report=report)
+                    findings=ordered(_unique(findings)), report=report, hashes=bundle.hashes())
 
 
 def plan(prepared: Prepared, draft: bool, account: str = None) -> str:
@@ -155,7 +160,7 @@ def plan(prepared: Prepared, draft: bool, account: str = None) -> str:
     lines = ["About to log in to %s%s and send:" % (
         RobotariumClient().url, " as %s" % account if account else ""), "",
         "Files, from %s:" % bundle.directory]
-    hashes = bundle.hashes()
+    hashes = prepared.hashes or bundle.hashes()
     for path in bundle.files:
         tag = "MAIN FILE" if path == bundle.main else \
             "generated" if path.name in bundle.generated else ""
@@ -193,7 +198,16 @@ def submit(target, credentials=None, draft: bool = None, simulate_first: bool = 
         env_file: A dotenv file to read the credentials from; see credentials.resolve.
         libraries_file: A libraries.txt to check imports against instead of the default.
     """
-    prepared = prepare(target, simulate_first=simulate_first, libraries_file=libraries_file)
+    project = as_project(target)
+    # From the build to the last upload, no other command may rebuild the bundle.
+    with locked(project.output_dir):
+        return _submit(project, credentials, draft, simulate_first, confirm, dry_run, strict,
+                       out, env_file, libraries_file)
+
+
+def _submit(project, credentials, draft, simulate_first, confirm, dry_run, strict, out,
+            env_file, libraries_file) -> SubmissionResult:
+    prepared = prepare(project, simulate_first=simulate_first, libraries_file=libraries_file)
     project, bundle = prepared.project, prepared.bundle
     draft = project.draft if draft is None else bool(draft)
 
@@ -229,6 +243,13 @@ def submit(target, credentials=None, draft: bool = None, simulate_first: bool = 
     if not go:
         out("Nothing sent.")
         return SubmissionResult(sent=False, prepared=prepared, draft=draft)
+
+    # What is sent is what the plan showed, file for file.
+    changed = _changed_since_plan(prepared)
+    if changed:
+        raise SubmissionRefused([Finding(ERROR, "The bundle changed after the plan was shown "
+                                                "(%s), so it is not what was confirmed. Run "
+                                                "submit again." % ", ".join(changed))])
 
     snapshot = ledger.snapshot(bundle, project.output_dir)
     entry = _ledger_entry(prepared, draft, snapshot)
@@ -290,6 +311,20 @@ def submit(target, credentials=None, draft: bool = None, simulate_first: bool = 
     return SubmissionResult(sent=True, prepared=prepared, draft=draft,
                             experiment_id=experiment_id, snapshot=snapshot, ledger=path,
                             uploaded=uploaded)
+
+
+def _changed_since_plan(prepared: Prepared) -> list:
+    """The bundle's files whose sha256 is not the plan's (or that are gone), by name."""
+    shown = prepared.hashes or {}
+    changed = []
+    for path in prepared.bundle.files:
+        try:
+            now = sha256(path)
+        except OSError:
+            now = None
+        if now != shown.get(path.name):
+            changed.append(path.name)
+    return changed
 
 
 def _consequence(stage: str, error: BaseException, uploaded: list, experiment_id) -> tuple:

@@ -35,10 +35,10 @@ from . import credentials as credentials_module
 from . import julia as julia_tools
 from . import budget, ledger, libraries, limits, preflight, results, scaffold, simulate, submission
 from ._version import __version__
-from .bundle import BundleError, build
+from .bundle import BundleError, BundleLocked, build, locked
 from .client import RobotariumClient, RobotariumError
 from .experiment import Experiment, Project, find_manifest, load_project
-from .findings import ERROR, INFO, WARNING, errors, ordered
+from .findings import ERROR, WARNING, Finding, errors, ordered
 
 DESCRIPTION = "Bundle, check, simulate and submit experiments to the Georgia Tech Robotarium."
 
@@ -57,7 +57,7 @@ def main(argv=None) -> int:
         if arguments.handler is run_submit:
             print("Nothing sent.", file=sys.stderr)
         return 1
-    except (credentials_module.CredentialsError, RobotariumError,
+    except (credentials_module.CredentialsError, RobotariumError, BundleLocked,
             julia_tools.JuliaToolError, FileNotFoundError, ValueError) as error:
         print("robotarium: %s" % error, file=sys.stderr)
         return 1
@@ -232,7 +232,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_project_argument(check)
     add_set_argument(check)
     check.add_argument("--file", dest="julia_file", metavar="FILE.jl",
-                       help="which .jl, when the bundle has several")
+                       help="which .jl to load, when the bundle has several (default "
+                            "backend.jl, as load_julia_backend() loads)")
     check.add_argument("--call", action="append", default=[], dest="calls",
                        metavar="FUNC[=JSON]",
                        help="after loading, call FUNC twice through call_json (with {} or the "
@@ -331,11 +332,17 @@ def run_init(arguments) -> int:
 
 def run_check(arguments) -> int:
     project = load(arguments)
+    with locked(project.output_dir):
+        return check_project(project, arguments)
+
+
+def check_project(project: Project, arguments) -> int:
     bundle = build(project.experiment, project.output_dir)
     findings = project.experiment.check() + preflight.check(
         bundle.files, project.experiment,
         libraries.load(arguments.libraries, simulator_path=project.simulator_path))
-    findings += budget_findings(project, bundle)
+    findings += budget.budget_findings(project, bundle)
+    findings += recording_findings(project, bundle)
     findings = ordered(list(dict.fromkeys(findings)))
     print_findings(findings)
     print_form(bundle)
@@ -354,31 +361,30 @@ def last_run(project: Project, bundle):
                                     project.experiment.load_config())
 
 
-def budget_findings(project: Project, bundle) -> list:
-    """
-    The duration checks a simulation makes, from the last simulation of these same files,
-    without simulating again; none when there is no such simulation.
-    """
-    last = last_run(project, bundle)
-    estimate = budget.startup_estimate(project, bundle)
-    found = list(estimate.findings) if estimate else []
-    if last is None:
-        return found
-    report = simulate.SimulationReport(returncode=0, rps="(last simulation)",
-                                       init_steps=last["init_steps"], steps=last["steps"])
-    return found + [each for each in report.duration_findings(
-        project.experiment, estimate.seconds if estimate else 0.0) if each.level != INFO]
+def recording_findings(project: Project, bundle) -> list:
+    """What `simulate` would refuse in [simulator]'s recording keys, as an ERROR."""
+    try:
+        recording_for(project, bundle, None)
+    except ValueError as error:
+        return [Finding(ERROR, "[simulator]: %s" % error)]
+    return []
 
 
 def run_bundle(arguments) -> int:
     project = load(arguments)
-    bundle = build(project.experiment, project.output_dir)
-    print_form(bundle)
+    with locked(project.output_dir):
+        bundle = build(project.experiment, project.output_dir)
+        print_form(bundle)
     return 0
 
 
 def run_simulate(arguments) -> int:
     project = apply_simulator_arguments(load(arguments), arguments)
+    with locked(project.output_dir):
+        return simulate_project(project, arguments)
+
+
+def simulate_project(project: Project, arguments) -> int:
     bundle = build(project.experiment, project.output_dir)
     if not arguments.no_check:
         findings = preflight.check(bundle.files, project.experiment,
@@ -399,7 +405,8 @@ def run_simulate(arguments) -> int:
                           seed=seed)
     simulate.save_last(report, bundle, project.output_dir, project.experiment.load_config())
     findings = report.findings(project.experiment,
-                               startup=estimate.seconds if estimate else None)
+                               startup=estimate.seconds if estimate else None,
+                               upper_bound=bool(estimate and estimate.upper_bound))
     if estimate:
         findings += estimate.findings
     findings = ordered(findings)
@@ -421,6 +428,7 @@ def recording_for(project: Project, bundle, arguments):
     when neither asks for a video or stills.
     """
     settings = dict(project.recording or {})
+    arguments = arguments if arguments is not None else argparse.Namespace()
     for key in ("fps", "every", "dpi", "frames_format"):
         if getattr(arguments, key, None) is not None:
             settings[key] = getattr(arguments, key)
@@ -450,6 +458,7 @@ def recording_for(project: Project, bundle, arguments):
 
 def run_submit(arguments) -> int:
     project = apply_simulator_arguments(project_for_submit(arguments), arguments)
+    # submission.submit holds the project's lock itself, from the build to the upload.
     result = submission.submit(project, draft=arguments.draft,
                                simulate_first=arguments.simulate_first,
                                confirm=not arguments.yes, dry_run=arguments.dry_run,
@@ -639,15 +648,25 @@ def run_julia_lookup(arguments) -> int:
 
 
 def run_julia_check(arguments) -> int:
-    project = load(arguments)
-    bundle = build(project.experiment, project.output_dir)
     calls = [julia_tools.parse_call(each) for each in arguments.calls]
+    if not arguments.cold and (arguments.keep_julia or arguments.cpus or arguments.scratch
+                               or arguments.keep_scratch):
+        raise ValueError("--keep-julia, --cpus, --scratch and --keep-scratch go with --cold.")
+    project = load(arguments)
+    with locked(project.output_dir):
+        return julia_check_project(project, arguments, calls)
+
+
+def julia_check_project(project: Project, arguments, calls: list) -> int:
+    bundle = build(project.experiment, project.output_dir)
+    julia_file, note = julia_tools.julia_file_for(bundle, arguments.julia_file)
+    if note:
+        print("Loading %s: %s." % (julia_file, note))
     if not arguments.cold:
-        if arguments.keep_julia or arguments.cpus or arguments.scratch or arguments.keep_scratch:
-            raise ValueError("--keep-julia, --cpus, --scratch and --keep-scratch go with --cold.")
-        print("Loading the Julia backend from %s, as the testbed will. The first run installs "
-              "Julia and the packages, which takes a while..." % bundle.directory)
-        loaded = julia_tools.check(bundle, arguments.julia_file, calls=calls,
+        print("Loading the Julia backend %s from %s, as the testbed will. The first run "
+              "installs Julia and the packages, which takes a while..."
+              % (julia_file, bundle.directory))
+        loaded = julia_tools.check(bundle, julia_file, calls=calls,
                                    timeout=arguments.timeout or 1800)
         print("Loaded %s, which exports: %s" % (loaded["module"], ", ".join(loaded["names"])))
         timings = loaded.get("timings") or {}
@@ -667,11 +686,16 @@ def run_julia_check(arguments) -> int:
             print("WARNING %s is %s here and %s on the testbed (libraries.txt), so this cold "
                   "start may not be the testbed's: pip install '%s==%s'."
                   % (name, mine or "not installed", theirs, name, theirs))
-    print("A cold start of the Julia backend in %s: Julia%s, the registry and every package "
-          "from nothing, as the testbed does at the start of each run. This takes minutes."
-          % (bundle.directory, " (reused)" if arguments.keep_julia else ""))
+    print("A cold start of the Julia backend %s in %s: Julia%s, the registry and every "
+          "package from nothing, as the testbed does at the start of each run. This takes "
+          "minutes." % (julia_file, bundle.directory,
+                        " (reused)" if arguments.keep_julia else ""))
+    if os.environ.get("JULIA_PKG_SERVER") == "":
+        print("JULIA_PKG_SERVER is empty: Julia's package servers are off, so every package is "
+              "a git clone, far slower than on the testbed. The budget will count the result "
+              "as an upper bound.")
     record = julia_tools.cold_check(
-        bundle, project.experiment, project.output_dir, julia_file=arguments.julia_file,
+        bundle, project.experiment, project.output_dir, julia_file=julia_file,
         timeout=arguments.timeout or 3600, calls=calls, keep_julia=arguments.keep_julia,
         cpus=arguments.cpus, scratch=arguments.scratch, keep_scratch=arguments.keep_scratch)
     print()

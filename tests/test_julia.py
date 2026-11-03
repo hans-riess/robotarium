@@ -6,9 +6,11 @@ runs with ROBOTARIUM_JULIA_TESTS=1).
 
 import json
 import os
+import shutil
 import sys
 import threading
 from functools import partial
+from pathlib import Path
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 
 import pytest
@@ -153,10 +155,13 @@ def test_a_cold_start_is_timed_and_saved(tmp_path, stand_ins, monkeypatch):
     assert saved["julia_version"] == "1.11.9" and saved["precompile_tasks"] == 2
     assert 0 < saved["startup_seconds"] <= saved["total_seconds"]
     assert record["names"] == ["Backend", "probe"]
-    assert not scratch.exists()
+    assert not scratch.exists()                       # made for the run, and removed after
+    assert saved["pkg_server"] == ""
 
     seen = json.loads((tmp_path / "environment.json").read_text())
-    assert seen["JULIA_DEPOT_PATH"] == str(scratch.resolve() / "depot")
+    # The trailing separator keeps Julia's own bundled depots (its precompiled standard
+    # libraries) after the scratch one.
+    assert seen["JULIA_DEPOT_PATH"] == str(scratch.resolve() / "depot") + os.pathsep
     assert seen["PYTHON_JULIAPKG_PROJECT"] == str(scratch.resolve() / "project")
     assert seen["JULIAUP_DEPOT_PATH"] == str(scratch.resolve() / "juliaup")
     assert seen["JULIA_NUM_PRECOMPILE_TASKS"] == "2" and seen["PYTHON_JULIAPKG_EXE"] is None
@@ -166,11 +171,33 @@ def test_a_cold_start_is_timed_and_saved(tmp_path, stand_ins, monkeypatch):
     assert "precompiling" in table and "(12 packages; Pkg says 3 s)" in table
     assert "first probe()" in table
 
-    # The budget now counts it, half again.
+    # The budget now counts it: measured without the package servers, as an upper bound.
     from robotarium.experiment import Project
     estimate = budget.startup_estimate(Project(experiment=experiment, output_dir=output), bundle)
-    assert estimate.source == "cold-start"
-    assert estimate.seconds == pytest.approx(1.5 * saved["startup_seconds"])
+    assert (estimate.source, estimate.upper_bound) == ("cold-start", True)
+    assert estimate.seconds == pytest.approx(saved["startup_seconds"])
+    assert "package servers were off" in table
+
+
+def test_a_cold_start_with_the_package_servers_counts_half_again(tmp_path, stand_ins,
+                                                                 monkeypatch):
+    monkeypatch.delenv("JULIA_PKG_SERVER", raising=False)
+    experiment, bundle = julia_project(tmp_path)
+    output = tmp_path / "exp" / ".robotarium"
+    record = julia.cold_check(bundle, experiment, output, echo=False)
+    assert record["pkg_server"] is None
+    from robotarium.experiment import Project
+    estimate = budget.startup_estimate(Project(experiment=experiment, output_dir=output), bundle)
+    assert (estimate.source, estimate.upper_bound) == ("cold-start", False)
+    assert estimate.seconds == pytest.approx(1.5 * record["startup_seconds"])
+
+
+def test_a_scratch_directory_that_was_given_is_emptied_not_removed(tmp_path, stand_ins):
+    experiment, bundle = julia_project(tmp_path)
+    scratch = tmp_path / "mine"
+    scratch.mkdir()
+    julia.cold_check(bundle, experiment, tmp_path / "out", scratch=scratch, echo=False)
+    assert scratch.is_dir() and not any(scratch.iterdir())
 
 
 def test_the_key_is_stable_and_follows_the_packages(tmp_path, stand_ins):
@@ -207,9 +234,20 @@ def test_a_cold_environment_hides_the_installed_julia(tmp_path):
             "JULIA_DEPOT_PATH": "/home/someone/.julia", "PYTHON_JULIAPKG_EXE": "/x/julia",
             "JULIA_PKG_USE_CLI_GIT": "true", "ROBOTARIUM_PASSWORD": "secret",
             "SSL_CERT_FILE": "/etc/ca.pem"}
+    write(tmp_path / "bin-julia" / "git", "#!/bin/sh\n").chmod(0o755)   # julia beside git
     environment = julia.cold_environment(tmp_path / "scratch", base=base)
-    assert environment["PATH"] == str(tmp_path / "other")
-    assert environment["JULIA_DEPOT_PATH"] == str((tmp_path / "scratch" / "depot").resolve())
+    # Each directory with julia or juliaup in it becomes one of links to everything else.
+    shadows = [tmp_path / "scratch" / "path" / "0", tmp_path / "scratch" / "path" / "2"]
+    assert environment["PATH"] == os.pathsep.join(
+        str(each.resolve()) for each in [shadows[0], tmp_path / "other", shadows[1]])
+    assert sorted(os.listdir(shadows[0])) == ["git"] and os.listdir(shadows[1]) == []
+    assert (shadows[0] / "git").resolve() == (tmp_path / "bin-julia" / "git").resolve()
+    found = {name: shutil.which(name, path=environment["PATH"])
+             for name in ("julia", "juliaup", "git")}
+    assert found["julia"] is None and found["juliaup"] is None and found["git"]
+    # The scratch depot first, then Julia's own (the trailing separator), never ~/.julia.
+    assert environment["JULIA_DEPOT_PATH"] == \
+        str((tmp_path / "scratch" / "depot").resolve()) + os.pathsep
     assert "PYTHON_JULIAPKG_EXE" not in environment and "ROBOTARIUM_PASSWORD" not in environment
     assert environment["JULIA_PKG_USE_CLI_GIT"] == "true"
     assert environment["SSL_CERT_FILE"] == "/etc/ca.pem"
@@ -284,3 +322,96 @@ def test_a_real_cold_start_with_json3(tmp_path):
                               calls=[("echo", {"a": 1})], keep_julia=True, echo=True)
     assert record["phases"]["packages"] and record["startup_seconds"] > 0
     assert (root / ".robotarium" / "julia" / "cold-start.json").is_file()
+
+
+# ---------------------------------------------------------------------------
+# which file `julia check` loads, and what it says when that fails
+# ---------------------------------------------------------------------------
+
+def julia_bundle(tmp_path, names):
+    root = tmp_path / "exp"
+    write(root / "main.py", "import robotarium_runtime\nimport rps.robotarium\n")
+    for name in names:
+        write(root / name, "module %s\nend\n" % Path(name).stem.capitalize())
+    experiment = Experiment(title="T", description="D", duration="auto", robots=1,
+                            main="main.py", files=list(names), root=root)
+    return build(experiment, root / ".robotarium")
+
+
+def test_several_julia_files_default_to_backend_jl(tmp_path):
+    bundle = julia_bundle(tmp_path, ["backend.jl", "shared.jl"])
+    name, note = julia.julia_file_for(bundle)
+    assert name == "backend.jl"
+    assert "backend.jl, shared.jl" in note and "--file names another" in note
+    assert julia.julia_file_for(bundle, "shared.jl") == ("shared.jl", None)
+    assert julia.julia_file_for(bundle, "src/shared.jl") == ("shared.jl", None)  # flat
+    with pytest.raises(julia.JuliaToolError, match="other.jl is not in the bundle"):
+        julia.julia_file_for(bundle, "other.jl")
+    only = julia_bundle(tmp_path / "one", ["model.jl"])
+    assert julia.julia_file_for(only) == ("model.jl", None)
+    neither = julia_bundle(tmp_path / "two", ["a.jl", "b.jl"])
+    with pytest.raises(julia.JuliaToolError, match="a.jl, b.jl and no backend.jl; name the one "
+                                                   "to load with --file"):
+        julia.julia_file_for(neither)
+
+
+def test_julia_check_says_which_file_it_loads(tmp_path, stand_ins, capsys):
+    from robotarium import cli
+    cli.main(["init", str(tmp_path / "exp"), "--julia"])
+    write(tmp_path / "exp" / "shared.jl", "# shared\n")
+    manifest = tmp_path / "exp" / "robotarium.toml"
+    manifest.write_text(manifest.read_text().replace('"backend.jl"', '"backend.jl", "shared.jl"'))
+    capsys.readouterr()
+    assert cli.main(["julia", "check", str(tmp_path / "exp")]) == 0
+    out = capsys.readouterr().out
+    assert "Loading backend.jl: the bundle has backend.jl, shared.jl" in out
+    assert "Loaded " in out
+
+
+SLOW_FIRST_CALL = r'''
+import time, types
+__version__ = "0.9.35"
+calls = []
+def probe(payload):
+    calls.append(payload)
+    if len(calls) == 1:
+        time.sleep(0.3)               # the first call compiles
+    return "probed " + payload
+class _Main:
+    def include(self, path):
+        self.Backend = types.SimpleNamespace(probe=probe)
+    def names(self, module):
+        return ["Backend", "probe"]
+    def seval(self, code):
+        return "1.11.9"
+Main = _Main()
+'''
+
+
+def test_a_name_called_twice_keeps_its_first_calls_time(tmp_path, stand_ins):
+    write(stand_ins / "juliacall" / "__init__.py", SLOW_FIRST_CALL)
+    experiment, bundle = julia_project(tmp_path)
+    result = julia.check(bundle, calls=[("probe", {}), ("probe", {"a": 1})])
+    assert result["first_calls"]["probe"] >= 0.3
+    assert result["warm_calls"]["probe"] < 0.3
+
+
+def test_a_failed_call_says_it_was_the_call_and_why(tmp_path, stand_ins):
+    experiment, bundle = julia_project(tmp_path)
+    with pytest.raises(julia.JuliaToolError) as raised:
+        julia.check(bundle, calls=[("nope", {})])
+    message = str(raised.value)
+    assert message.startswith("backend.jl loaded, but calling nope() failed:")
+    assert "AttributeError" in message and "nope" in message
+
+
+def test_a_failed_load_says_it_was_the_load_and_why(tmp_path, stand_ins):
+    write(stand_ins / "juliacall" / "__init__.py",
+          "class _Main:\n    def include(self, path):\n"
+          "        raise RuntimeError('UndefVarError: `JSON4` not defined')\nMain = _Main()\n")
+    experiment, bundle = julia_project(tmp_path)
+    with pytest.raises(julia.JuliaToolError) as raised:
+        julia.check(bundle)
+    message = str(raised.value)
+    assert message.startswith("Loading backend.jl failed:")
+    assert "JuliaBackendError" in message and "JSON4" in message
